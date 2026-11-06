@@ -23,9 +23,19 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 
+#include <algorithm>
+#include "llvm/Support/ErrorHandling.h"
+
 #define N_MIN_INTRA_INSTRUCTION_COUNT 3
 
 namespace {
+
+llvm::cl::opt<std::string> enable_rasm_predicate{
+    "RASM-predicate",
+    llvm::cl::desc("RV32 equality-predicate signature selection; requires RASM for the same functions"),
+    llvm::cl::value_desc("functions")};
+
+constexpr unsigned PredicateGapNops = 3;
 
 // LLVM describes JAL as a call even when COMPAS uses rd=x0 to transfer to a
 // local block. Treat these transfers like ordinary direct branches in both
@@ -60,10 +70,61 @@ RISCVRasm::RISCVRasm() : RISCVDmr{} {}
 
 RISCVRacfed::RISCVRacfed() : RISCVRasm{} {}
 
+void validateRasmPredicateOptions(const llvm::MachineFunction &MF) {
+  const std::string name{MF.getName()};
+  const auto selected = [&](const std::string &functions) {
+    return riscv_common::inCSString(functions, name);
+  };
+  if (!selected(enable_rasm_predicate))
+    return;
+
+  if (!selected(llvm::cl::enable_rasm))
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate requires RASM for the same function");
+  const auto &ST = MF.getSubtarget<llvm::RISCVSubtarget>();
+  if (ST.is64Bit() || ST.hasStdExtCOrZca())
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate requires RV32 without compressed instructions");
+  if (selected(llvm::cl::enable_nzdc) ||
+      selected(llvm::cl::enable_nzdc_nemesis) ||
+      selected(llvm::cl::enable_nzdc_nemesec) ||
+      selected(llvm::cl::enable_swift) || selected(llvm::cl::enable_eddi) ||
+      llvm::cl::enable_repair || selected(llvm::cl::enable_cfcss) ||
+      selected(llvm::cl::enable_racfed))
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate does not yet support DMR, REPAIR, CFCSS or "
+        "RACFED composition");
+
+  const auto *TII = ST.getInstrInfo();
+  for (const auto &MBB : MF) {
+    for (const auto &MI : MBB) {
+      if (MI.isInlineAsm())
+        llvm::report_fatal_error(
+            "COMPAS: RASM-predicate prototype does not support inline assembly");
+      if ((MI.isCall() && !is_local_unconditional_jump(MI)) ||
+          TII->isTailCall(MI))
+        llvm::report_fatal_error(
+            "COMPAS: RASM-predicate prototype requires leaf functions, "
+            "including no tail calls");
+      for (const auto &operand : MI.operands()) {
+        if (operand.isReg() &&
+            (operand.getReg() == llvm::RISCV::X5 ||
+             operand.getReg() == llvm::RISCV::X29))
+          llvm::report_fatal_error(
+              "COMPAS: RASM-predicate input uses reserved signature or "
+              "predicate register x5/x29");
+      }
+    }
+  }
+}
+
 bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
+  // Repeat the read-only guard here for callers that run this pass directly.
+  validateRasmPredicateOptions(MF);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   TII_ = MF_->getSubtarget().getInstrInfo();
+  predicate_mode_ = riscv_common::inCSString(enable_rasm_predicate, fname_);
 
   if (!riscv_common::inCSString(llvm::cl::enable_rasm,
                                 std::string{MF_->getName()})) {
@@ -74,10 +135,89 @@ bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
 
   regions_ = std::make_unique<riscv_common::RsmRegions>(
       *MF_, llvm::cl::enable_rasm.getValue());
+  if (predicate_mode_)
+    validate_predicate_mode();
+
   init();
   harden();
 
   return true;
+}
+
+void RISCVRasm::validate_predicate_mode() {
+  for (auto &MBB : *MF_) {
+    if (MBB.empty() || (&MBB != &MF_->front() && MBB.pred_empty()) ||
+        (MBB.succ_size() == 1 && *MBB.succ_begin() == &MBB))
+      llvm::report_fatal_error("COMPAS: RASM-predicate does not support empty, unreachable or self-loop blocks");
+    unsigned conditional_count = 0;
+    for (auto &MI : MBB) {
+      if (MI.isCall() && !is_local_unconditional_jump(MI))
+        llvm::report_fatal_error("COMPAS: RASM-predicate prototype requires leaf functions");
+      if (MI.isIndirectBranch() && !MI.isReturn())
+        llvm::report_fatal_error("COMPAS: RASM-predicate does not support indirect branches");
+      if (!MI.isConditionalBranch())
+        continue;
+      auto predicate = riscv_common::getSoftBranchPredicate(MI);
+      if (!predicate)
+        llvm::report_fatal_error("COMPAS: RASM-predicate supports only direct BEQ/BNE register branches");
+      if (++conditional_count != 1)
+        llvm::report_fatal_error("COMPAS: RASM-predicate requires one conditional branch per block");
+      for (auto next = std::next(MI.getIterator()); next != MBB.end(); ++next)
+        if (!next->isDebugInstr())
+          llvm::report_fatal_error("COMPAS: RASM-predicate requires a terminal conditional branch with implicit fallthrough");
+      auto *fallthrough = MBB.getFallThrough();
+      if (!fallthrough || fallthrough == predicate->taken)
+        llvm::report_fatal_error("COMPAS: RASM-predicate requires distinct taken and fallthrough successors");
+      if (predicate->lhs == kRTS || predicate->rhs == kRTS ||
+          predicate->lhs == kC || predicate->rhs == kC)
+        llvm::report_fatal_error("COMPAS: RASM-predicate branch operands alias reserved signature registers");
+    }
+  }
+}
+
+void RISCVRasm::validate_predicate_branch_span() {
+  // COMPAS executes after LLVM's branch-relaxation pass. Conservatively bound
+  // the whole final function, including its error block and worst-case block
+  // alignment padding, so every internal branch displacement fits signed 13
+  // bits without a later expansion changing the predicate/spacing template.
+  constexpr uint64_t MaxSpan = 4092;
+  uint64_t span = 0;
+  const auto add_bytes = [&](uint64_t bytes) {
+    if (bytes > MaxSpan - span)
+      llvm::report_fatal_error(
+          "COMPAS: RASM-predicate final conservative function span exceeds "
+          "4092 bytes; late branch relaxation is unsupported");
+    span += bytes;
+  };
+  for (const auto &MBB : *MF_) {
+    add_bytes(MBB.getAlignment().value() - 1);
+    for (const auto &MI : MBB) {
+      const unsigned size = TII_->getInstSizeInBytes(MI);
+      if ((!size && !MI.isMetaInstruction()) || size % 4)
+        llvm::report_fatal_error(
+            "COMPAS: RASM-predicate requires known fixed-width instruction "
+            "sizes for branch-span validation");
+      add_bytes(size);
+    }
+  }
+}
+
+void RISCVRasm::generate_predicate_entry_spacing() {
+  // Put padding inside the destination block rather than after a terminator.
+  // This retains valid MBB structure and makes the cost explicit: these NOPs
+  // execute on every normal nonentry block entry, unlike unreachable padding
+  // in the handwritten local study. Error handling retains its own contract.
+  for (auto &MBB : *MF_) {
+    if (&MBB == &MF_->front() || err_bbs_.count(&MBB))
+      continue;
+    auto insert = MBB.begin();
+    const auto DL = MBB.empty() ? llvm::DebugLoc{} : MBB.front().getDebugLoc();
+    for (unsigned i = 0; i < PredicateGapNops; ++i)
+      llvm::BuildMI(MBB, insert, DL, TII_->get(llvm::RISCV::ADDI))
+          .addReg(riscv_common::k0, llvm::RegState::Define)
+          .addReg(riscv_common::k0)
+          .addImm(0);
+  }
 }
 
 void RISCVRasm::init() {
@@ -122,6 +262,11 @@ void RISCVRasm::harden() {
   // Step 4: Calculate traversal adjustment values for non-trivial
   // instructions
   generate_traversal_adjustments();
+
+  if (predicate_mode_) {
+    generate_predicate_entry_spacing();
+    validate_predicate_branch_span();
+  }
 
   /*
     for (auto &MBB : *MF_) {
@@ -578,6 +723,27 @@ void RISCVRasm::generate_traversal_adjustments() {
         assert(target && "monitored branch has no normal destination!");
 
         const auto target_adjustment = calculate_adjustment(&MBB, target);
+        if (predicate_mode_ && regions_->monitorsBranch(*MI)) {
+          auto *fallthrough = regions_->resolve(MBB.getFallThrough());
+          if (!fallthrough || err_bbs_.count(fallthrough) || carried_adjustment)
+            llvm::report_fatal_error("COMPAS: unsupported RASM-predicate successor adjustment");
+          const auto false_adjustment = calculate_adjustment(&MBB, fallthrough);
+          riscv_common::emitSoftBranchPredicate(*MI, kC);
+          riscv_common::emitPredicateSelectedAdd(*MI, kRTS, kC,
+                                               false_adjustment,
+                                               target_adjustment);
+          for (unsigned i = 0; i < PredicateGapNops; ++i)
+            llvm::BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
+                          TII_->get(llvm::RISCV::ADDI))
+                .addReg(riscv_common::k0, llvm::RegState::Define)
+                .addReg(riscv_common::k0)
+                .addImm(0);
+          // On normal fallthrough the selected false adjustment has already
+          // executed. Do not subtract a taken adjustment or overwrite it with
+          // the old fallthrough compensation.
+          carried_adjustment = false_adjustment;
+          continue;
+        }
         const short adjustment = target_adjustment - carried_adjustment;
         assert_imm(adjustment);
         llvm::BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
@@ -651,6 +817,8 @@ void RISCVRasm::generate_traversal_adjustments() {
     const short adjustment =
         calculate_adjustment(&MBB, target) - carried_adjustment;
     assert_imm(adjustment);
+    if (predicate_mode_ && adjustment == 0)
+      continue;
     // Preserve the existing one-instruction optimization when the layout
     // successor can only be entered by this fallthrough edge.
     if (target == physical_target &&

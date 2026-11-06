@@ -136,6 +136,17 @@ void materialize_frame_offset(llvm::MachineBasicBlock &MBB,
 #endif
 }
 
+bool is_physical_integer_register(llvm::Register reg) {
+  return reg.isPhysical() && reg >= llvm::RISCV::X0 &&
+         reg <= llvm::RISCV::X31;
+}
+
+void require_insertion_point(const llvm::MachineInstr &before) {
+  if (!before.getParent() || !before.getParent()->getParent())
+    llvm::report_fatal_error(
+        "COMPAS: soft predicate requires an instruction in a machine function");
+}
+
 struct SpillSlot {
   llvm::Register reg;
   unsigned store_opcode;
@@ -907,6 +918,107 @@ void riscv_common::loadCallRegsAs(
     llvm::MachineBasicBlock *MBB, llvm::MachineBasicBlock::iterator insert,
     CallFrameBank bank) {
   access_call_regs(snapshot_regs, MBB, insert, true, bank, &copies);
+}
+
+std::optional<riscv_common::SoftBranchPredicate>
+riscv_common::getSoftBranchPredicate(const llvm::MachineInstr &branch) {
+  if ((branch.getOpcode() != llvm::RISCV::BEQ &&
+       branch.getOpcode() != llvm::RISCV::BNE) ||
+      branch.getNumOperands() < 3 || branch.getNumExplicitOperands() != 3)
+    return std::nullopt;
+
+  const auto &lhs = branch.getOperand(0);
+  const auto &rhs = branch.getOperand(1);
+  const auto &target = branch.getOperand(2);
+  if (!lhs.isReg() || !rhs.isReg() || !lhs.isUse() || !rhs.isUse() ||
+      lhs.getSubReg() || rhs.getSubReg() ||
+      !is_physical_integer_register(lhs.getReg()) ||
+      !is_physical_integer_register(rhs.getReg()) || !target.isMBB())
+    return std::nullopt;
+
+  return SoftBranchPredicate{lhs.getReg(), rhs.getReg(), target.getMBB(),
+                             branch.getOpcode() == llvm::RISCV::BEQ};
+}
+
+llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
+    llvm::MachineInstr &before, llvm::Register scratch) {
+  const auto predicate = getSoftBranchPredicate(before);
+  if (!predicate)
+    llvm::report_fatal_error(
+        "COMPAS: soft predicate supports only direct BEQ/BNE with physical "
+        "integer operands");
+  if (!is_physical_integer_register(scratch) || scratch == k0 ||
+      scratch == predicate->lhs || scratch == predicate->rhs)
+    llvm::report_fatal_error(
+        "COMPAS: soft predicate scratch must be a nonzero physical integer "
+        "register distinct from the branch operands");
+  require_insertion_point(before);
+
+  auto &MBB = *before.getParent();
+  const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
+  const auto insert = before.getIterator();
+  const auto &DL = before.getDebugLoc();
+  llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::XOR))
+      .addDef(scratch)
+      .addReg(predicate->lhs)
+      .addReg(predicate->rhs);
+
+  if (predicate->equality)
+    return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::SLTIU))
+        .addDef(scratch)
+        .addReg(scratch)
+        .addImm(1)
+        .getInstr();
+
+  return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::SLTU))
+      .addDef(scratch)
+      .addReg(k0)
+      .addReg(scratch)
+      .getInstr();
+}
+
+llvm::MachineInstr *riscv_common::emitPredicateSelectedAdd(
+    llvm::MachineInstr &before, llvm::Register signature,
+    llvm::Register scratch, int64_t falseAdjustment, int64_t trueAdjustment) {
+  if (!is_physical_integer_register(signature) || signature == k0 ||
+      !is_physical_integer_register(scratch) || scratch == k0 ||
+      signature == scratch)
+    llvm::report_fatal_error(
+        "COMPAS: predicate-selected add requires distinct nonzero physical "
+        "integer signature and scratch registers");
+
+  // Check the base first so the following bounds cannot overflow int64_t,
+  // including when callers pass an arbitrary trueAdjustment.
+  if (!llvm::isInt<12>(falseAdjustment) ||
+      trueAdjustment < falseAdjustment - 2048 ||
+      trueAdjustment > falseAdjustment + 2047)
+    llvm::report_fatal_error(
+        "COMPAS: predicate-selected add base and difference must fit signed "
+        "12-bit immediates");
+  const int64_t difference = trueAdjustment - falseAdjustment;
+  require_insertion_point(before);
+
+  auto &MBB = *before.getParent();
+  const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
+  const auto insert = before.getIterator();
+  const auto &DL = before.getDebugLoc();
+  llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::SUB))
+      .addDef(scratch)
+      .addReg(k0)
+      .addReg(scratch);
+  llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::ANDI))
+      .addDef(scratch)
+      .addReg(scratch)
+      .addImm(difference);
+  llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::ADDI))
+      .addDef(signature)
+      .addReg(signature)
+      .addImm(falseAdjustment);
+  return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::ADD))
+      .addDef(signature)
+      .addReg(signature)
+      .addReg(scratch)
+      .getInstr();
 }
 
 void riscv_common::saveRegs(std::vector<llvm::Register> regs,

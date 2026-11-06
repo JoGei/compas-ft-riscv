@@ -423,6 +423,7 @@ bool RISCVDmr::ignoreMF() {
 
 bool RISCVDmr::runOnMachineFunction(llvm::MachineFunction &MF) {
 
+  validateRasmPredicateOptions(MF);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   // This snapshot must precede every DMR mutation, including call-boundary

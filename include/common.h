@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 
 #include "RISCV.h"
@@ -140,6 +142,36 @@ void loadCallRegsAs(const std::vector<llvm::Register> &snapshot_regs,
                     const std::map<llvm::Register, llvm::Register> &copies,
                     llvm::MachineBasicBlock *,
                     llvm::MachineBasicBlock::iterator, CallFrameBank);
+
+// A direct equality/inequality branch over physical integer registers. This
+// description carries no signature-monitor or data-duplication policy.
+struct SoftBranchPredicate {
+  llvm::Register lhs;
+  llvm::Register rhs;
+  llvm::MachineBasicBlock *taken;
+  bool equality;
+};
+
+std::optional<SoftBranchPredicate>
+getSoftBranchPredicate(const llvm::MachineInstr &branch);
+
+// Materialize the branch's taken predicate as 0 or 1 in a caller-owned scratch
+// register immediately before the unchanged branch. The scratch must be a
+// nonzero physical integer register distinct from both branch operands.
+// Return the final predicate-producing instruction; reject unsupported input.
+llvm::MachineInstr *emitSoftBranchPredicate(llvm::MachineInstr &before,
+                                           llvm::Register scratch);
+
+// Precondition: scratch contains a Boolean predicate (0 or 1). Destructively
+// consume it to add falseAdjustment or trueAdjustment to signature, using only
+// base integer instructions. The caller owns register reservation, predicate
+// integrity and instruction spacing. Return the final signature ADD.
+llvm::MachineInstr *emitPredicateSelectedAdd(llvm::MachineInstr &before,
+                                            llvm::Register signature,
+                                            llvm::Register scratch,
+                                            int64_t falseAdjustment,
+                                            int64_t trueAdjustment);
+
 // save registers in the vector one by one onto the stack and do this
 // at the instruction point pointed to by iterator
 void saveRegs(std::vector<llvm::Register>, llvm::MachineBasicBlock*,

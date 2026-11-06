@@ -24,6 +24,10 @@
 #include "RISCVRsm.h"
 #include "common.h"
 
+// Called by the first COMPAS pipeline hook before other hardening passes can
+// mutate a function selected for the experimental predicate lowering.
+void validateRasmPredicateOptions(const llvm::MachineFunction &MF);
+
 class RISCVRasm : public RISCVDmr {
 public:
   // constructor
@@ -55,6 +59,11 @@ protected:
   // for convenience
   std::set<llvm::MachineBasicBlock *> err_bbs_{};
   std::unique_ptr<riscv_common::RsmRegions> regions_;
+  // Opt-in first consumer of the shared soft-predicate lowering helpers.
+  bool predicate_mode_{false};
+  void validate_predicate_mode();
+  void validate_predicate_branch_span();
+  void generate_predicate_entry_spacing();
 
   // for initialization purposes
   virtual void init() override;
