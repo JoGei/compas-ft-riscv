@@ -155,10 +155,17 @@ struct SoftBranchPredicate {
 std::optional<SoftBranchPredicate>
 getSoftBranchPredicate(const llvm::MachineInstr &branch);
 
-// Materialize the branch's taken predicate as 0 or 1 in a caller-owned scratch
-// register immediately before the unchanged branch. The scratch must be a
-// nonzero physical integer register distinct from both branch operands.
+// Materialize the supplied taken predicate as 0 or 1 immediately before an
+// independent insertion anchor. Both source registers must be physical integer
+// registers; scratch must be nonzero and distinct from both. The descriptor's
+// taken block must belong to the anchor's function. No branch is modified.
 // Return the final predicate-producing instruction; reject unsupported input.
+llvm::MachineInstr *emitSoftBranchPredicate(
+    llvm::MachineInstr &before, const SoftBranchPredicate &predicate,
+    llvm::Register scratch);
+
+// Compatibility overload: derive the predicate from the unchanged BEQ/BNE
+// insertion anchor rather than from explicitly supplied source operands.
 llvm::MachineInstr *emitSoftBranchPredicate(llvm::MachineInstr &before,
                                            llvm::Register scratch);
 
@@ -171,6 +178,20 @@ llvm::MachineInstr *emitPredicateSelectedAdd(llvm::MachineInstr &before,
                                             llvm::Register scratch,
                                             int64_t falseAdjustment,
                                             int64_t trueAdjustment);
+
+// Locate the optional Seal5-generated instruction without requiring its enum
+// in ordinary LLVM builds. Availability also requires the function's +xpred
+// feature. The Boolean predicate denotes the taken outcome.
+std::optional<unsigned>
+getXPredSelectiveAccumulateOpcode(const llvm::MachineFunction &MF);
+
+// Return nullptr without inserting anything when either adjustment is outside
+// [-32, 31]. Otherwise emit one tied-rd NZ_SACC_I with true immediate first.
+// The predicate register is read, not overwritten. Missing XPred support is an
+// error: clients must request the extension explicitly before using this API.
+llvm::MachineInstr *tryEmitXPredPredicateSelectedAdd(
+    llvm::MachineInstr &before, llvm::Register signature,
+    llvm::Register predicate, int64_t falseAdjustment, int64_t trueAdjustment);
 
 // save registers in the vector one by one onto the stack and do this
 // at the instruction point pointed to by iterator

@@ -15,6 +15,7 @@
  */
 
 #include "RISCVRasm.h"
+#include "RISCVSubtarget.h"
 
 #include "common.h"
 #include "llvm/CodeGen/CommandFlags.h"
@@ -24,7 +25,10 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 
 #include <algorithm>
+#include <functional>
+#include <numeric>
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 
 #define N_MIN_INTRA_INSTRUCTION_COUNT 3
 
@@ -34,6 +38,36 @@ llvm::cl::opt<std::string> enable_rasm_predicate{
     "RASM-predicate",
     llvm::cl::desc("RV32 equality-predicate signature selection; requires RASM for the same functions"),
     llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<std::string> enable_rasm_predicate_unpadded{
+    "RASM-predicate-unpadded",
+    llvm::cl::desc("Omit predicate-to-branch and successor-entry NOP spacing; requires RASM-predicate for the same functions"),
+    llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<std::string> enable_rasm_predicate_shadow{
+    "RASM-predicate-shadow",
+    llvm::cl::desc("Derive predicates from NZDC shadow operands; requires RASM-predicate and plain NZDC with CGS for the same functions"),
+    llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<std::string> enable_rasm_predicate_xpred{
+    "RASM-predicate-xpred",
+    llvm::cl::desc("Use XPred sacc.i for signed-six-bit predicate adjustments; requires RASM-predicate and +xpred"),
+    llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<std::string> enable_rasm_predicate_psp_simm6{
+    "RASM-predicate-psp-simm6",
+    llvm::cl::desc("Try bounded joint RASM label allocation for signed-six-bit predicate adjustments; independent of XPred lowering"),
+    llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<unsigned> rasm_predicate_psp_seed{
+    "RASM-predicate-psp-seed",
+    llvm::cl::desc("Seed for the bounded RASM predicate signed-six-bit allocator"),
+    llvm::cl::init(1)};
+
+llvm::cl::opt<unsigned> rasm_predicate_psp_max_attempts{
+    "RASM-predicate-psp-max-attempts",
+    llvm::cl::desc("Bound on signed-six-bit allocation attempts (maximum 32; zero selects the legacy fallback)"),
+    llvm::cl::init(32)};
 
 constexpr unsigned PredicateGapNops = 3;
 
@@ -60,6 +94,57 @@ bool is_local_unconditional_jump(const llvm::MachineInstr &MI) {
   return !MI.isConditionalBranch() && direct_branch_target(MI) != nullptr;
 }
 
+bool is_error_block(const llvm::MachineBasicBlock &MBB) {
+  return MBB.succ_size() == 1 && *MBB.succ_begin() == &MBB;
+}
+
+void validate_predicate_cfg(const llvm::MachineFunction &MF,
+                            bool allow_detector_blocks,
+                            const riscv_common::RsmRegions *regions = nullptr) {
+  for (const auto &MBB : MF) {
+    // Original self-loop blocks are rejected before DMR. Plain NZDC only
+    // creates its terminal error block; branches to it are detector checks,
+    // not application predicates requiring signature selection.
+    if (allow_detector_blocks && is_error_block(MBB))
+      continue;
+    if (regions && regions->isTransparent(&MBB))
+      continue;
+    if (MBB.empty() || (&MBB != &MF.front() && MBB.pred_empty()) ||
+        is_error_block(MBB))
+      llvm::report_fatal_error("COMPAS: RASM-predicate does not support empty, unreachable or self-loop application blocks");
+    unsigned conditional_count = 0;
+    for (const auto &MI : MBB) {
+      if (MI.isIndirectBranch() && !MI.isReturn())
+        llvm::report_fatal_error("COMPAS: RASM-predicate does not support indirect branches");
+      if (!MI.isConditionalBranch())
+        continue;
+      auto *target = direct_branch_target(MI);
+      if (allow_detector_blocks && target && is_error_block(*target))
+        continue;
+      if (regions && !regions->monitorsBranch(MI))
+        continue;
+      auto predicate = riscv_common::getSoftBranchPredicate(MI);
+      if (!predicate)
+        llvm::report_fatal_error("COMPAS: RASM-predicate supports only direct BEQ/BNE register branches");
+      if (++conditional_count != 1)
+        llvm::report_fatal_error("COMPAS: RASM-predicate requires one application conditional branch per block");
+      for (auto next = std::next(MI.getIterator()); next != MBB.end(); ++next)
+        if (!next->isDebugInstr())
+          llvm::report_fatal_error("COMPAS: RASM-predicate requires a terminal conditional branch with implicit fallthrough");
+      const auto next_block = std::next(MBB.getIterator());
+      const auto *fallthrough = next_block == MF.end() ? nullptr : &*next_block;
+      if (!fallthrough || !MBB.isSuccessor(fallthrough) ||
+          fallthrough == predicate->taken)
+        llvm::report_fatal_error("COMPAS: RASM-predicate requires distinct taken and fallthrough successors");
+      if (predicate->lhs == llvm::RISCV::X5 ||
+          predicate->rhs == llvm::RISCV::X5 ||
+          predicate->lhs == llvm::RISCV::X29 ||
+          predicate->rhs == llvm::RISCV::X29)
+        llvm::report_fatal_error("COMPAS: RASM-predicate branch operands alias reserved signature registers");
+    }
+  }
+}
+
 } // namespace
 
 llvm::FunctionPass *llvm::createRISCVRasm() { return new RISCVRasm(); }
@@ -70,12 +155,22 @@ RISCVRasm::RISCVRasm() : RISCVDmr{} {}
 
 RISCVRacfed::RISCVRacfed() : RISCVRasm{} {}
 
-void validateRasmPredicateOptions(const llvm::MachineFunction &MF) {
+void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
+                                  bool after_dmr) {
   const std::string name{MF.getName()};
   const auto selected = [&](const std::string &functions) {
     return riscv_common::inCSString(functions, name);
   };
-  if (!selected(enable_rasm_predicate))
+  const bool predicate = selected(enable_rasm_predicate);
+  const bool unpadded = selected(enable_rasm_predicate_unpadded);
+  const bool shadow = selected(enable_rasm_predicate_shadow);
+  const bool xpred = selected(enable_rasm_predicate_xpred);
+  const bool psp_simm6 = selected(enable_rasm_predicate_psp_simm6);
+  if (!predicate && (unpadded || shadow || xpred || psp_simm6))
+    llvm::report_fatal_error(
+        "COMPAS: RASM predicate modifiers (unpadded, shadow, xpred, psp-simm6) require "
+        "RASM-predicate for the same function");
+  if (!predicate)
     return;
 
   if (!selected(llvm::cl::enable_rasm))
@@ -85,15 +180,30 @@ void validateRasmPredicateOptions(const llvm::MachineFunction &MF) {
   if (ST.is64Bit() || ST.hasStdExtCOrZca())
     llvm::report_fatal_error(
         "COMPAS: RASM-predicate requires RV32 without compressed instructions");
-  if (selected(llvm::cl::enable_nzdc) ||
-      selected(llvm::cl::enable_nzdc_nemesis) ||
+  if (xpred && !riscv_common::getXPredSelectiveAccumulateOpcode(MF))
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate-xpred requires an XPred-enabled LLVM build "
+        "and the +xpred function feature");
+  if (selected(llvm::cl::enable_nzdc_nemesis) ||
       selected(llvm::cl::enable_nzdc_nemesec) ||
       selected(llvm::cl::enable_swift) || selected(llvm::cl::enable_eddi) ||
       llvm::cl::enable_repair || selected(llvm::cl::enable_cfcss) ||
       selected(llvm::cl::enable_racfed))
     llvm::report_fatal_error(
-        "COMPAS: RASM-predicate does not yet support DMR, REPAIR, CFCSS or "
-        "RACFED composition");
+        "COMPAS: RASM-predicate only supports plain NZDC composition; "
+        "NEMESIS, NEMESEC, SWIFT, EDDI, REPAIR, CFCSS and RACFED are unsupported");
+  if (selected(llvm::cl::enable_nzdc) && selected(llvm::cl::enable_fgs))
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate with NZDC requires CGS; FGS is unsupported");
+  if (shadow && !selected(llvm::cl::enable_nzdc))
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate-shadow requires plain NZDC with CGS for the "
+        "same function");
+
+  // The first COMPAS hook validates original code. DMR-generated detector
+  // branches and shadow operands are validated separately after that pass.
+  if (after_dmr && selected(llvm::cl::enable_nzdc))
+    return;
 
   const auto *TII = ST.getInstrInfo();
   for (const auto &MBB : MF) {
@@ -116,15 +226,23 @@ void validateRasmPredicateOptions(const llvm::MachineFunction &MF) {
       }
     }
   }
+  validate_predicate_cfg(MF, false);
 }
 
 bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
-  // Repeat the read-only guard here for callers that run this pass directly.
-  validateRasmPredicateOptions(MF);
+  validateRasmPredicateOptions(MF, true);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   TII_ = MF_->getSubtarget().getInstrInfo();
   predicate_mode_ = riscv_common::inCSString(enable_rasm_predicate, fname_);
+  predicate_unpadded_ =
+      riscv_common::inCSString(enable_rasm_predicate_unpadded, fname_);
+  predicate_shadow_mode_ =
+      riscv_common::inCSString(enable_rasm_predicate_shadow, fname_);
+  predicate_xpred_mode_ =
+      riscv_common::inCSString(enable_rasm_predicate_xpred, fname_);
+  predicate_psp_simm6_ =
+      riscv_common::inCSString(enable_rasm_predicate_psp_simm6, fname_);
 
   if (!riscv_common::inCSString(llvm::cl::enable_rasm,
                                 std::string{MF_->getName()})) {
@@ -145,34 +263,15 @@ bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
 }
 
 void RISCVRasm::validate_predicate_mode() {
-  for (auto &MBB : *MF_) {
-    if (MBB.empty() || (&MBB != &MF_->front() && MBB.pred_empty()) ||
-        (MBB.succ_size() == 1 && *MBB.succ_begin() == &MBB))
-      llvm::report_fatal_error("COMPAS: RASM-predicate does not support empty, unreachable or self-loop blocks");
-    unsigned conditional_count = 0;
-    for (auto &MI : MBB) {
-      if (MI.isCall() && !is_local_unconditional_jump(MI))
-        llvm::report_fatal_error("COMPAS: RASM-predicate prototype requires leaf functions");
-      if (MI.isIndirectBranch() && !MI.isReturn())
-        llvm::report_fatal_error("COMPAS: RASM-predicate does not support indirect branches");
-      if (!MI.isConditionalBranch())
-        continue;
-      auto predicate = riscv_common::getSoftBranchPredicate(MI);
-      if (!predicate)
-        llvm::report_fatal_error("COMPAS: RASM-predicate supports only direct BEQ/BNE register branches");
-      if (++conditional_count != 1)
-        llvm::report_fatal_error("COMPAS: RASM-predicate requires one conditional branch per block");
-      for (auto next = std::next(MI.getIterator()); next != MBB.end(); ++next)
-        if (!next->isDebugInstr())
-          llvm::report_fatal_error("COMPAS: RASM-predicate requires a terminal conditional branch with implicit fallthrough");
-      auto *fallthrough = MBB.getFallThrough();
-      if (!fallthrough || fallthrough == predicate->taken)
-        llvm::report_fatal_error("COMPAS: RASM-predicate requires distinct taken and fallthrough successors");
-      if (predicate->lhs == kRTS || predicate->rhs == kRTS ||
-          predicate->lhs == kC || predicate->rhs == kC)
-        llvm::report_fatal_error("COMPAS: RASM-predicate branch operands alias reserved signature registers");
-    }
-  }
+  validate_predicate_cfg(*MF_,
+      riscv_common::inCSString(llvm::cl::enable_nzdc, fname_), regions_.get());
+}
+
+void RISCVRasm::finalizePredicateLayout() {
+  if (!predicate_mode_)
+    return;
+  generate_predicate_entry_spacing();
+  validate_predicate_branch_span();
 }
 
 void RISCVRasm::validate_predicate_branch_span() {
@@ -203,6 +302,8 @@ void RISCVRasm::validate_predicate_branch_span() {
 }
 
 void RISCVRasm::generate_predicate_entry_spacing() {
+  if (predicate_unpadded_)
+    return;
   // Put padding inside the destination block rather than after a terminator.
   // This retains valid MBB structure and makes the cost explicit: these NOPs
   // execute on every normal nonentry block entry, unlike unreachable padding
@@ -221,6 +322,8 @@ void RISCVRasm::generate_predicate_entry_spacing() {
 }
 
 void RISCVRasm::init() {
+  predicate_sites_ = predicate_simm6_sites_ = predicate_fused_sites_ =
+      predicate_range_fallbacks_ = 0;
   mbb_sigs_.clear();
   mbb_sum_ii_sigs_.clear();
   mbb_signature_arbr_instrs_.clear();
@@ -263,10 +366,14 @@ void RISCVRasm::harden() {
   // instructions
   generate_traversal_adjustments();
 
-  if (predicate_mode_) {
-    generate_predicate_entry_spacing();
-    validate_predicate_branch_span();
-  }
+  if (predicate_xpred_mode_ || predicate_psp_simm6_)
+    llvm::outs() << "COMPAS_XPRED function=" << fname_
+                 << " requested=" << predicate_xpred_mode_
+                 << " sites=" << predicate_sites_
+                 << " simm6_fit=" << predicate_simm6_sites_
+                 << " fused=" << predicate_fused_sites_
+                 << " software=" << predicate_sites_ - predicate_fused_sites_
+                 << " range_fallback=" << predicate_range_fallbacks_ << "\n";
 
   /*
     for (auto &MBB : *MF_) {
@@ -552,12 +659,195 @@ bool RISCVRasm::branches_to_errbbs(const llvm::MachineInstr *mi) {
   return err_bbs_.find(target) != err_bbs_.end();
 }
 
+bool RISCVRasm::try_generate_psp_simm6_signatures() {
+  // A bounded joint search: propose unique signed-ten-bit x labels, then
+  // match unique q=x+y entry labels within all incoming conditional-edge
+  // domains. Retrying x assignments makes this a joint allocation policy,
+  // rather than independently shrinking the original label ranges. This is
+  // RASM-only: RACFED's intra-block totals would change these equations.
+  constexpr unsigned MaxAttempts = 32;
+  constexpr unsigned MaxMatchingSteps = 200000;
+  constexpr int MinQ = -1024;
+  constexpr int MaxQ = 1022;
+  std::vector<llvm::MachineBasicBlock *> blocks;
+  std::map<const llvm::MachineBasicBlock *, unsigned> index;
+  for (auto &MBB : *MF_) {
+    if (err_bbs_.count(&MBB) || regions_->isTransparent(&MBB))
+      continue;
+    index.emplace(&MBB, blocks.size());
+    blocks.push_back(&MBB);
+  }
+  const unsigned count = blocks.size();
+  std::vector<std::set<unsigned>> normal_predecessors(count);
+  std::vector<std::set<unsigned>> conditional_predecessors(count);
+  unsigned sites = 0;
+  for (unsigned source = 0; source < count; ++source) {
+    auto &MBB = *blocks[source];
+    for (auto *physical_target : MBB.successors()) {
+      const auto *target = regions_->resolve(physical_target);
+      const auto found = index.find(target);
+      if (found != index.end())
+        normal_predecessors[found->second].insert(source);
+    }
+    for (const auto &MI : MBB) {
+      if (!MI.isConditionalBranch() || !regions_->monitorsBranch(MI))
+        continue;
+      const auto *taken = regions_->resolve(direct_branch_target(MI));
+      if (!taken || index.find(taken) == index.end())
+        continue; // NZDC detector branches do not select application intent.
+      const auto *fallthrough = regions_->resolve(MBB.getFallThrough());
+      if (!fallthrough || index.find(fallthrough) == index.end())
+        llvm::report_fatal_error(
+            "COMPAS: PSP allocation requires two normal predicate successors");
+      conditional_predecessors[index.at(taken)].insert(source);
+      conditional_predecessors[index.at(fallthrough)].insert(source);
+      ++sites;
+    }
+  }
+
+  unsigned attempts = 0;
+  unsigned matching_steps = 0;
+  const unsigned limit = std::min<unsigned>(rasm_predicate_psp_max_attempts, MaxAttempts);
+  const auto report = [&](bool allocated, const char *reason) {
+    llvm::outs() << "COMPAS_PSP function=" << fname_
+                 << " status=" << (allocated ? "allocated" : "fallback")
+                 << " reason=" << reason << " blocks=" << count
+                 << " sites=" << sites << " seed=" << rasm_predicate_psp_seed
+                 << " attempts=" << attempts << " max_attempts=" << limit
+                 << " matching_steps=" << matching_steps
+                 << " max_matching_steps=" << MaxMatchingSteps
+                 << " require_nonzero_normal_edges=1\n";
+  };
+  if (count > 1024)
+    llvm::report_fatal_error(
+        "COMPAS: PSP allocation exceeds the 1024 distinct signed-ten-bit block labels");
+  if (!count || !limit) {
+    report(false, !limit ? "attempt_limit" : "label_capacity");
+    return false;
+  }
+
+  // Use a separate engine so the selected lowering (software or XPred) does
+  // not change allocations or consume the legacy signature/return RNG stream.
+  std::mt19937 engine(rasm_predicate_psp_seed);
+  std::vector<int> permutation(count);
+  std::iota(permutation.begin(), permutation.end(), 0);
+  for (; attempts < limit && matching_steps < MaxMatchingSteps; ) {
+    ++attempts;
+    if (attempts > 1)
+      std::shuffle(permutation.begin(), permutation.end(), engine);
+    const int origin = std::uniform_int_distribution<int>(
+        -512, 512 - static_cast<int>(count))(engine);
+    std::vector<int> x(count);
+    for (unsigned i = 0; i < count; ++i)
+      x[i] = origin + permutation[i];
+
+    std::vector<std::vector<int>> domains(count);
+    bool feasible = true;
+    for (unsigned target = 0; target < count; ++target) {
+      int lower = std::max(MinQ, x[target] - 512);
+      int upper = std::min(MaxQ, x[target] + 511);
+      for (unsigned source : conditional_predecessors[target]) {
+        lower = std::max(lower, x[source] - 32);
+        upper = std::min(upper, x[source] + 31);
+      }
+      std::set<int> forbidden{x[target]}; // y must be nonzero.
+      for (unsigned source : normal_predecessors[target])
+        forbidden.insert(x[source]); // No zero logical normal-edge update.
+      for (int q = lower; q <= upper; ++q)
+        if (!forbidden.count(q))
+          domains[target].push_back(q);
+      if (domains[target].empty()) {
+        feasible = false;
+        break;
+      }
+      std::shuffle(domains[target].begin(), domains[target].end(), engine);
+    }
+    if (!feasible)
+      continue;
+
+    std::vector<unsigned> order(count);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
+      return domains[a].size() < domains[b].size();
+    });
+    std::vector<int> owner(MaxQ - MinQ + 1, -1);
+    std::vector<int> q(count, 0);
+    std::vector<bool> seen(owner.size());
+    std::function<bool(unsigned)> augment = [&](unsigned target) {
+      for (int candidate : domains[target]) {
+        if (matching_steps == MaxMatchingSteps)
+          return false;
+        ++matching_steps;
+        const unsigned slot = candidate - MinQ;
+        if (seen[slot])
+          continue;
+        seen[slot] = true;
+        if (owner[slot] < 0 || augment(static_cast<unsigned>(owner[slot]))) {
+          owner[slot] = target;
+          q[target] = candidate;
+          return true;
+        }
+      }
+      return false;
+    };
+    for (unsigned target : order) {
+      std::fill(seen.begin(), seen.end(), false);
+      if (!augment(target)) {
+        feasible = false;
+        break;
+      }
+    }
+    if (!feasible)
+      continue;
+
+    // Validate the completed assignment independently of the search choices
+    // before publishing any labels to the instrumentation pass.
+    std::set<int> unique_x, unique_q;
+    for (unsigned target = 0; target < count; ++target) {
+      const int y = q[target] - x[target];
+      if (!llvm::isInt<10>(x[target]) || !llvm::isInt<10>(y) || !y ||
+          !unique_x.insert(x[target]).second || !unique_q.insert(q[target]).second)
+        llvm::report_fatal_error("COMPAS: invalid constrained PSP label assignment");
+      for (unsigned source : conditional_predecessors[target])
+        if (!llvm::isInt<6>(q[target] - x[source]))
+          llvm::report_fatal_error("COMPAS: constrained PSP edge exceeds signed-six-bit range");
+      for (unsigned source : normal_predecessors[target])
+        if (q[target] == x[source])
+          llvm::report_fatal_error("COMPAS: constrained PSP produced a zero normal-edge update");
+    }
+    for (unsigned i = 0; i < count; ++i)
+      mbb_sigs_[blocks[i]] = {static_cast<short>(x[i]), static_cast<short>(q[i] - x[i])};
+    report(true, "matched");
+    return true;
+  }
+  report(false, matching_steps == MaxMatchingSteps ? "matching_budget" : "search_exhausted");
+  return false;
+}
+
 void RISCVRasm::generate_signatures() {
   //////////////////////////////////////////////////////////////////////////////
   // Step 1: Assign compile time signatues and random arbitration value
   // "subRanPrevVal" to each basic block of the function.
   llvm::outs() << "RACFED S1: Assigning compile time sigs to each MBB of "
                << MF_->getName() << "\n";
+
+  if (predicate_psp_simm6_) {
+    for (auto &MBB : *MF_)
+      if (is_error_block(MBB))
+        err_bbs_.insert(&MBB);
+    if (try_generate_psp_simm6_signatures()) {
+      for (const auto &MBB : *MF_) {
+        const auto found = mbb_sigs_.find(&MBB);
+        if (found != mbb_sigs_.end())
+          llvm::outs() << "COMPAS_PSP_LABEL function=" << fname_
+                       << " block=" << MBB.getNumber()
+                       << " x=" << found->second.first
+                       << " y=" << found->second.second
+                       << " q=" << found->second.first + found->second.second << "\n";
+      }
+      return;
+    }
+  }
 
   // assigning compile time sigs to each MBB
   std::set<short> sigs_sofar{}, sum_sofar{};
@@ -592,6 +882,16 @@ void RISCVRasm::generate_signatures() {
       }
     }
   }
+  if (predicate_psp_simm6_ || predicate_xpred_mode_)
+    for (const auto &MBB : *MF_) {
+      const auto found = mbb_sigs_.find(&MBB);
+      if (found != mbb_sigs_.end())
+        llvm::outs() << "COMPAS_PSP_LABEL function=" << fname_
+                     << " block=" << MBB.getNumber()
+                     << " x=" << found->second.first
+                     << " y=" << found->second.second
+                     << " q=" << found->second.first + found->second.second << "\n";
+    }
 }
 
 void RISCVRasm::generate_signature_checks() {
@@ -725,14 +1025,56 @@ void RISCVRasm::generate_traversal_adjustments() {
         const auto target_adjustment = calculate_adjustment(&MBB, target);
         if (predicate_mode_ && regions_->monitorsBranch(*MI)) {
           auto *fallthrough = regions_->resolve(MBB.getFallThrough());
-          if (!fallthrough || err_bbs_.count(fallthrough) || carried_adjustment)
+          if (!fallthrough || fallthrough == target ||
+              err_bbs_.count(fallthrough) || carried_adjustment)
             llvm::report_fatal_error("COMPAS: unsupported RASM-predicate successor adjustment");
           const auto false_adjustment = calculate_adjustment(&MBB, fallthrough);
-          riscv_common::emitSoftBranchPredicate(*MI, kC);
-          riscv_common::emitPredicateSelectedAdd(*MI, kRTS, kC,
-                                               false_adjustment,
-                                               target_adjustment);
-          for (unsigned i = 0; i < PredicateGapNops; ++i)
+          auto predicate = riscv_common::getSoftBranchPredicate(*MI);
+          if (!predicate)
+            llvm::report_fatal_error(
+                "COMPAS: RASM-predicate lost its application BEQ/BNE");
+          if (predicate_shadow_mode_) {
+            const auto shadow_source = [&](llvm::Register source) {
+              const auto pair = P2S_.find(source);
+              if (pair == P2S_.end() || pair->second == kRTS ||
+                  pair->second == kC)
+                llvm::report_fatal_error(
+                    "COMPAS: RASM-predicate-shadow requires a mapped NZDC "
+                    "primary operand with an independent shadow register");
+              return pair->second;
+            };
+            // Map x0 too: NZDC's shadow zero is the faultable x27 stream,
+            // not the architectural zero used by the primary branch.
+            predicate->lhs = shadow_source(predicate->lhs);
+            predicate->rhs = shadow_source(predicate->rhs);
+          }
+          riscv_common::emitSoftBranchPredicate(*MI, *predicate, kC);
+          const bool simm6_fit = llvm::isInt<6>(false_adjustment) &&
+                                  llvm::isInt<6>(target_adjustment);
+          ++predicate_sites_;
+          predicate_simm6_sites_ += simm6_fit;
+          const bool fused = predicate_xpred_mode_ &&
+              riscv_common::tryEmitXPredPredicateSelectedAdd(
+                  *MI, kRTS, kC, false_adjustment, target_adjustment);
+          if (fused) {
+            ++predicate_fused_sites_;
+          } else {
+            if (predicate_xpred_mode_)
+              ++predicate_range_fallbacks_;
+            riscv_common::emitPredicateSelectedAdd(*MI, kRTS, kC,
+                                                 false_adjustment,
+                                                 target_adjustment);
+          }
+          if (predicate_xpred_mode_ || predicate_psp_simm6_)
+            llvm::outs() << "COMPAS_XPRED_SITE function=" << fname_
+                         << " block=" << MBB.getNumber()
+                         << " taken=" << target->getNumber()
+                         << " fallthrough=" << fallthrough->getNumber()
+                         << " true=" << target_adjustment
+                         << " false=" << false_adjustment
+                         << " fused=" << fused << "\n";
+          const unsigned gap_nops = predicate_unpadded_ ? 0 : PredicateGapNops;
+          for (unsigned i = 0; i < gap_nops; ++i)
             llvm::BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
                           TII_->get(llvm::RISCV::ADDI))
                 .addReg(riscv_common::k0, llvm::RegState::Define)

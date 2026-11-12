@@ -423,7 +423,6 @@ bool RISCVDmr::ignoreMF() {
 
 bool RISCVDmr::runOnMachineFunction(llvm::MachineFunction &MF) {
 
-  validateRasmPredicateOptions(MF);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   // This snapshot must precede every DMR mutation, including call-boundary
@@ -3028,8 +3027,7 @@ void RISCVDmr::protectCalls() {
           // these regs are already done by duplicateInstructions()
           continue;
         }
-        if (riscv_common::inCSString(llvm::cl::enable_cfcss, fname_) &&
-            r == llvm::RISCV::X5) {
+        if (llvm::is_contained(riscv_common::signatureRegisters(*MF_), r)) {
           continue;
         }
 

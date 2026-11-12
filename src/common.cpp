@@ -947,12 +947,27 @@ llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
     llvm::report_fatal_error(
         "COMPAS: soft predicate supports only direct BEQ/BNE with physical "
         "integer operands");
+  return emitSoftBranchPredicate(before, *predicate, scratch);
+}
+
+llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
+    llvm::MachineInstr &before, const SoftBranchPredicate &predicate,
+    llvm::Register scratch) {
+  require_insertion_point(before);
+  if (!is_physical_integer_register(predicate.lhs) ||
+      !is_physical_integer_register(predicate.rhs))
+    llvm::report_fatal_error(
+        "COMPAS: soft predicate sources must be physical integer registers");
+  if (!predicate.taken ||
+      predicate.taken->getParent() != before.getParent()->getParent())
+    llvm::report_fatal_error(
+        "COMPAS: soft predicate taken block must belong to the insertion "
+        "anchor's function");
   if (!is_physical_integer_register(scratch) || scratch == k0 ||
-      scratch == predicate->lhs || scratch == predicate->rhs)
+      scratch == predicate.lhs || scratch == predicate.rhs)
     llvm::report_fatal_error(
         "COMPAS: soft predicate scratch must be a nonzero physical integer "
         "register distinct from the branch operands");
-  require_insertion_point(before);
 
   auto &MBB = *before.getParent();
   const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
@@ -960,10 +975,10 @@ llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
   const auto &DL = before.getDebugLoc();
   llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::XOR))
       .addDef(scratch)
-      .addReg(predicate->lhs)
-      .addReg(predicate->rhs);
+      .addReg(predicate.lhs)
+      .addReg(predicate.rhs);
 
-  if (predicate->equality)
+  if (predicate.equality)
     return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::SLTIU))
         .addDef(scratch)
         .addReg(scratch)
@@ -1018,6 +1033,54 @@ llvm::MachineInstr *riscv_common::emitPredicateSelectedAdd(
       .addDef(signature)
       .addReg(signature)
       .addReg(scratch)
+      .getInstr();
+}
+
+std::optional<unsigned> riscv_common::getXPredSelectiveAccumulateOpcode(
+    const llvm::MachineFunction &MF) {
+  const auto &ST = MF.getSubtarget<llvm::RISCVSubtarget>();
+  const auto *TII = ST.getInstrInfo();
+  for (unsigned opcode = 0; opcode < TII->getNumOpcodes(); ++opcode) {
+    if (TII->getName(opcode) != "NZ_SACC_I")
+      continue;
+    if (ST.is64Bit() || !ST.checkFeatures("+xpred"))
+      return std::nullopt;
+    const auto &desc = TII->get(opcode);
+    if (desc.getNumOperands() != 5 || desc.getNumDefs() != 1 ||
+        desc.getOperandConstraint(1, llvm::MCOI::TIED_TO) != 0)
+      llvm::report_fatal_error(
+          "COMPAS: unexpected NZ_SACC_I operand layout; expected tied rd");
+    return opcode;
+  }
+  return std::nullopt;
+}
+
+llvm::MachineInstr *riscv_common::tryEmitXPredPredicateSelectedAdd(
+    llvm::MachineInstr &before, llvm::Register signature,
+    llvm::Register predicate, int64_t falseAdjustment, int64_t trueAdjustment) {
+  if (!llvm::isInt<6>(falseAdjustment) || !llvm::isInt<6>(trueAdjustment))
+    return nullptr;
+  require_insertion_point(before);
+  if (!is_physical_integer_register(signature) || signature == k0 ||
+      !is_physical_integer_register(predicate) || predicate == k0 ||
+      signature == predicate)
+    llvm::report_fatal_error(
+        "COMPAS: XPred selected add requires distinct nonzero physical "
+        "integer signature and predicate registers");
+  auto &MBB = *before.getParent();
+  const auto opcode = getXPredSelectiveAccumulateOpcode(*MBB.getParent());
+  if (!opcode)
+    llvm::report_fatal_error(
+        "COMPAS: RASM-predicate-xpred requires an XPred-enabled LLVM build "
+        "and the +xpred function feature");
+  const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
+  return llvm::BuildMI(MBB, before.getIterator(), before.getDebugLoc(),
+                       TII->get(*opcode))
+      .addDef(signature)
+      .addReg(signature)
+      .addReg(predicate)
+      .addImm(trueAdjustment)
+      .addImm(falseAdjustment)
       .getInstr();
 }
 

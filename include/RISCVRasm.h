@@ -26,7 +26,8 @@
 
 // Called by the first COMPAS pipeline hook before other hardening passes can
 // mutate a function selected for the experimental predicate lowering.
-void validateRasmPredicateOptions(const llvm::MachineFunction &MF);
+void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
+                                  bool after_dmr = false);
 
 class RISCVRasm : public RISCVDmr {
 public:
@@ -34,6 +35,10 @@ public:
   RISCVRasm();
   // override the transformation function
   bool runOnMachineFunction(llvm::MachineFunction &) override;
+
+  // Run after the shared pipeline normalizes check continuations, so padding
+  // and the conservative branch-span check describe the final layout.
+  void finalizePredicateLayout();
 
   static unsigned get_runtime_signature_reg(void) { return kRTS; }
 
@@ -61,6 +66,16 @@ protected:
   std::unique_ptr<riscv_common::RsmRegions> regions_;
   // Opt-in first consumer of the shared soft-predicate lowering helpers.
   bool predicate_mode_{false};
+  // Independent per-function modifiers; the historical mode remains padded
+  // and derives the predicate from the primary application-branch operands.
+  bool predicate_unpadded_{false};
+  bool predicate_shadow_mode_{false};
+  bool predicate_xpred_mode_{false};
+  bool predicate_psp_simm6_{false};
+  unsigned predicate_sites_{0};
+  unsigned predicate_simm6_sites_{0};
+  unsigned predicate_fused_sites_{0};
+  unsigned predicate_range_fallbacks_{0};
   void validate_predicate_mode();
   void validate_predicate_branch_span();
   void generate_predicate_entry_spacing();
@@ -80,6 +95,7 @@ protected:
   bool branches_to_errbbs(const llvm::MachineInstr *mi);
 
   void generate_signatures();
+  bool try_generate_psp_simm6_signatures();
   virtual void generate_intrablock_signature_updates();
   void generate_signature_checks();
   void generate_traversal_adjustments();
