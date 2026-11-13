@@ -43,6 +43,8 @@ void setRsmInstructionCategory(llvm::MachineInstr &MI, RsmCategory category);
 class RsmRegions {
 public:
   RsmRegions(llvm::MachineFunction &MF, const std::string &selection);
+  RsmRegions(llvm::MachineFunction &MF, unsigned region_mask,
+             unsigned instruction_mask);
 
   bool isTransparent(const llvm::MachineBasicBlock *MBB) const;
   llvm::MachineBasicBlock *resolve(llvm::MachineBasicBlock *MBB) const;
@@ -53,7 +55,9 @@ public:
 
 private:
   RsmFunctionInfo &info_;
-  unsigned mask_;
+  unsigned region_mask_;
+  unsigned instruction_mask_;
+  bool selectsRegionInstruction(const llvm::MachineInstr &MI) const;
 };
 
 // Split real conditional transfers and restore PHI/CFG/liveness metadata.

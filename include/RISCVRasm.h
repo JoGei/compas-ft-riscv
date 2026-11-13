@@ -28,6 +28,7 @@
 // mutate a function selected for the experimental predicate lowering.
 void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
                                   bool after_dmr = false);
+void validateRacfedCompaSeCOptions(const llvm::MachineFunction &MF);
 
 class RISCVRasm : public RISCVDmr {
 public:
@@ -126,6 +127,8 @@ protected:
   virtual void generate_intrablock_signature_updates() override;
 
 private:
+  bool compasec_policy_{false};
+  void generate_compasec_intrablock_signature_updates();
   // map each MBB to its sum of all intra-block instruction updates
   std::map<const llvm::MachineBasicBlock *,
            std::map<const llvm::MachineInstr *, short>>

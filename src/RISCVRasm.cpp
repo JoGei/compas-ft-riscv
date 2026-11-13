@@ -34,6 +34,11 @@
 
 namespace {
 
+llvm::cl::opt<std::string> enable_racfed_compasec{
+    "RACFED-compasec",
+    llvm::cl::desc("CompaSeC RACFED policy: orig+dmr regions, all-class ledger, nonzero post-instruction updates from one instruction; requires RACFED for the same functions"),
+    llvm::cl::value_desc("functions")};
+
 llvm::cl::opt<std::string> enable_rasm_predicate{
     "RASM-predicate",
     llvm::cl::desc("RV32 equality-predicate signature selection; requires RASM for the same functions"),
@@ -154,6 +159,29 @@ llvm::FunctionPass *llvm::createRISCVRacfed() { return new RISCVRacfed(); }
 RISCVRasm::RISCVRasm() : RISCVDmr{} {}
 
 RISCVRacfed::RISCVRacfed() : RISCVRasm{} {}
+
+void validateRacfedCompaSeCOptions(const llvm::MachineFunction &MF) {
+  const std::string name{MF.getName()};
+  if (!riscv_common::inCSString(enable_racfed_compasec, name))
+    return;
+  if (!riscv_common::inCSString(llvm::cl::enable_racfed, name))
+    llvm::report_fatal_error(
+        "COMPAS: RACFED-compasec requires RACFED for the same function");
+  if (riscv_common::inCSString(llvm::cl::enable_rasm, name) ||
+      riscv_common::inCSString(llvm::cl::enable_cfcss, name))
+    llvm::report_fatal_error(
+        "COMPAS: RACFED-compasec cannot compose with another signature monitor");
+  const unsigned mask = riscv_common::getRsmInstructionMask(
+      MF, llvm::cl::enable_racfed.getValue());
+  const unsigned region_mask =
+      static_cast<unsigned>(riscv_common::RsmCategory::Original) |
+      static_cast<unsigned>(riscv_common::RsmCategory::Dmr);
+  // Bare/all permits the profile to select its documented independent masks.
+  // orig+dmr spells its region mask explicitly; other masks are contradictory.
+  if (mask != riscv_common::kRsmAll && mask != region_mask)
+    llvm::report_fatal_error(
+        "COMPAS: RACFED-compasec requires a bare/all or orig+dmr RACFED selection; its ledger always includes all provenance classes");
+}
 
 void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
                                   bool after_dmr) {
@@ -1182,6 +1210,7 @@ void RISCVRasm::generate_traversal_adjustments() {
 // ------------------------------------------- RACFED --------------------------
 
 bool RISCVRacfed::runOnMachineFunction(llvm::MachineFunction &MF) {
+  validateRacfedCompaSeCOptions(MF);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   TII_ = MF_->getSubtarget().getInstrInfo();
@@ -1193,8 +1222,19 @@ bool RISCVRacfed::runOnMachineFunction(llvm::MachineFunction &MF) {
 
   llvm::outs() << "Running RACFED pass on " << MF_->getName() << "\n";
 
-  regions_ = std::make_unique<riscv_common::RsmRegions>(
-      *MF_, llvm::cl::enable_racfed.getValue());
+  compasec_policy_ = riscv_common::inCSString(enable_racfed_compasec, fname_);
+  if (compasec_policy_) {
+    const unsigned region_mask =
+        static_cast<unsigned>(riscv_common::RsmCategory::Original) |
+        static_cast<unsigned>(riscv_common::RsmCategory::Dmr);
+    regions_ = std::make_unique<riscv_common::RsmRegions>(
+        *MF_, region_mask, riscv_common::kRsmAll);
+    llvm::outs() << "COMPAS_RACFED_POLICY function=" << fname_
+                 << " regions=orig+dmr ledger=orig+dmr+balance minimum=1 placement=after nonzero=1\n";
+  } else {
+    regions_ = std::make_unique<riscv_common::RsmRegions>(
+        *MF_, llvm::cl::enable_racfed.getValue());
+  }
   init();
 
   llvm::outs() << "Running RACFED harden() on " << MF_->getName() << "\n";
@@ -1222,6 +1262,10 @@ void RISCVRasm::generate_intrablock_signature_updates() {
 }
 
 void RISCVRacfed::generate_intrablock_signature_updates() {
+  if (compasec_policy_) {
+    generate_compasec_intrablock_signature_updates();
+    return;
+  }
 
   llvm::outs() << "RACFED S2: Intra-block runtime signature updates on "
                << MF_->getName() << "\n";
@@ -1323,6 +1367,80 @@ void RISCVRacfed::generate_intrablock_signature_updates() {
             .addImm(rv);
       }
     }
+  }
+}
+
+void RISCVRacfed::generate_compasec_intrablock_signature_updates() {
+  const auto &provenance = riscv_common::rsmFunctionInfo(*MF_).instructions;
+  const auto eligible_instruction = [&](const llvm::MachineInstr &MI) {
+    return regions_->monitorsInstruction(MI) &&
+           riscv_common::frameHelper(MI) == riscv_common::FrameHelper::None &&
+           !MI.isMetaInstruction() &&
+           !MI.getFlag(llvm::MachineInstr::FrameSetup) &&
+           !MI.getFlag(llvm::MachineInstr::FrameDestroy) && !MI.isReturn() &&
+           !TII_->isTailCall(MI) && !is_local_unconditional_jump(MI) &&
+           (!MI.isBranch() || MI.isConditionalBranch()) &&
+           (!MI.isConditionalBranch() || branches_to_errbbs(&MI));
+  };
+  for (auto &MBB : *MF_) {
+    if (err_bbs_.count(&MBB))
+      continue;
+    if (regions_->isTransparent(&MBB)) {
+      // Assigning an excluded bridge's contributions to an adjacent logical
+      // region needs path-sensitive ownership. Never silently discard them.
+      if (std::any_of(MBB.begin(), MBB.end(), eligible_instruction))
+        llvm::report_fatal_error(
+            "COMPAS: RACFED-compasec cannot account eligible instructions in a transparent checking bridge");
+      continue;
+    }
+    // Collect first: monitor instructions must never recursively enter the
+    // ledger, and each update belongs after its instruction on the normal path.
+    std::vector<llvm::MachineInstr *> eligible;
+    const auto start = &MBB == &MF_->front()
+                           ? riscv_common::signatureEntryInsertion(*MF_)
+                           : MBB.begin();
+    bool active = false;
+    for (auto &MI : MBB) {
+      if (MI.getIterator() == start)
+        active = true;
+      if (!active || !eligible_instruction(MI))
+        continue;
+      eligible.push_back(&MI);
+    }
+    short sum = 0;
+    const short entry = mbb_sigs_.at(&MBB).first;
+    unsigned ordinal = 0;
+    for (auto *MI : eligible) {
+      const short current = entry + sum;
+      std::uniform_int_distribution<short> values{-1024 - current,
+                                                   1023 - current};
+      short update = 0;
+      while (update == 0)
+        update = values(gen_);
+      assert_imm(update);
+      llvm::BuildMI(MBB, std::next(MI->getIterator()), MI->getDebugLoc(),
+                    TII_->get(llvm::RISCV::ADDI))
+          .addReg(kRTS, llvm::RegState::Define)
+          .addReg(kRTS)
+          .addImm(update);
+      mi_random_value_[&MBB][MI] = update;
+      sum += update;
+      const auto category = provenance.at(MI);
+      const char *category_name =
+          category == riscv_common::RsmCategory::Original ? "orig" :
+          category == riscv_common::RsmCategory::Dmr ? "dmr" : "balance";
+      llvm::outs() << "COMPAS_RACFED_UI function=" << fname_
+                   << " block=" << MBB.getNumber() << " ordinal=" << ordinal++
+                   << " category=" << category_name
+                   << " opcode=" << TII_->getName(MI->getOpcode())
+                   << " delta=" << update << " before=" << current
+                   << " after=" << entry + sum << " placement=after\n";
+    }
+    mbb_sum_ii_sigs_[&MBB] = sum;
+    llvm::outs() << "COMPAS_RACFED_REGION function=" << fname_
+                 << " block=" << MBB.getNumber() << " x=" << entry
+                 << " y=" << mbb_sigs_.at(&MBB).second
+                 << " eligible=" << eligible.size() << " sum=" << sum << "\n";
   }
 }
 

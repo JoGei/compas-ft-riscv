@@ -33,6 +33,7 @@ public:
     // Validate experimental selections even when no hardening mode is enabled.
     // The guard must also see original operands before any DMR mutation.
     validateRasmPredicateOptions(MF);
+    validateRacfedCompaSeCOptions(MF);
     if (llvm::cl::enable_eddi.empty() && llvm::cl::enable_swift.empty() &&
         llvm::cl::enable_nzdc.empty() &&
         llvm::cl::enable_nzdc_nemesis.empty() &&

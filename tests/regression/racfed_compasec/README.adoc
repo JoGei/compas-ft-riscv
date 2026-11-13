@@ -1,0 +1,12 @@
+= CompaSeC RACFED policy regression
+
+Run `python3 run.py --llc <llc> --clang <clang> --cc <RV32-capable-gcc> --qemu <qemu-riscv32> --build-dir <output>`.
+Optional `--legacy-llc <archived-llc>` checks that ordinary RACFED emits identical assembly for the short-region fixture.
+This standalone test requires machine verification and saves commands, logs, assembly, object, ELF and a JSON result.
+
+The short IR checks one-, two- and three-computation regions, including nonzero post-instruction updates for the first and last computation.
+The functional C fixture checks primary and shadow computation coverage, successful entry balance checks without separate continuation signatures, both branch outcomes, ordinary/ordered/narrow/zero stores, and signature preservation around an ordinary call.
+Its literal return and memory oracle runs on RV32 user-mode QEMU; project-level ETISS and RTL validation remains separate.
+Negative cases require missing-RACFED and conflicting-policy diagnostics; mixed functions check that the opt-in does not leak.
+
+These checks establish emitted structure and fault-free behavior, not skip coverage.

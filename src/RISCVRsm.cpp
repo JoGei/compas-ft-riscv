@@ -76,7 +76,14 @@ void riscv_common::setRsmInstructionCategory(llvm::MachineInstr &MI,
 
 riscv_common::RsmRegions::RsmRegions(llvm::MachineFunction &MF,
                                      const std::string &selection)
-    : info_(rsmFunctionInfo(MF)), mask_(getRsmInstructionMask(MF, selection)) {
+    : RsmRegions(MF, getRsmInstructionMask(MF, selection),
+                 getRsmInstructionMask(MF, selection)) {}
+
+riscv_common::RsmRegions::RsmRegions(llvm::MachineFunction &MF,
+                                    unsigned region_mask,
+                                    unsigned instruction_mask)
+    : info_(rsmFunctionInfo(MF)), region_mask_(region_mask),
+      instruction_mask_(instruction_mask) {
   // Standalone RSM invocations need no preceding DMR pass. In that case every
   // current instruction is application code, exactly as it is at DMR entry.
   if (!info_.recorded)
@@ -87,7 +94,7 @@ riscv_common::RsmRegions::RsmRegions(llvm::MachineFunction &MF,
   std::set<const llvm::MachineInstr *> selected_branches;
   for (const auto &MBB : MF)
     for (const auto &MI : MBB)
-      if (MI.isConditionalBranch() && monitorsInstruction(MI))
+      if (MI.isConditionalBranch() && selectsRegionInstruction(MI))
         selected_branches.insert(&MI);
   normalizeControlFlow(MF, &selected_branches);
 }
@@ -97,7 +104,7 @@ bool riscv_common::RsmRegions::isTransparent(
   if (!info_.duplicate_blocks.count(MBB))
     return false;
   return std::none_of(MBB->begin(), MBB->end(), [this](const auto &MI) {
-    return monitorsInstruction(MI);
+    return selectsRegionInstruction(MI);
   });
 }
 
@@ -124,12 +131,19 @@ bool riscv_common::RsmRegions::monitorsInstruction(
     const llvm::MachineInstr &MI) const {
   const auto found = info_.instructions.find(&MI);
   return found != info_.instructions.end() &&
-         (mask_ & static_cast<unsigned>(found->second));
+         (instruction_mask_ & static_cast<unsigned>(found->second));
+}
+
+bool riscv_common::RsmRegions::selectsRegionInstruction(
+    const llvm::MachineInstr &MI) const {
+  const auto found = info_.instructions.find(&MI);
+  return found != info_.instructions.end() &&
+         (region_mask_ & static_cast<unsigned>(found->second));
 }
 
 bool riscv_common::RsmRegions::monitorsBranch(
     const llvm::MachineInstr &MI) const {
-  return MI.isBranch() && monitorsInstruction(MI);
+  return MI.isBranch() && selectsRegionInstruction(MI);
 }
 
 std::set<llvm::MachineBasicBlock *>
