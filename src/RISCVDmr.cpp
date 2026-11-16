@@ -3095,6 +3095,7 @@ void RISCVDmr::protectBranches() {
     return;
   }
 
+  const bool shadow_predicate = riscv_common::usesRsmShadowPredicate(*MF_);
   if (config_.psb == ProtectStrategyBranch::B2) {
     for (auto MI : branches_) {
       if (MI->isUnconditionalBranch()) {
@@ -3122,7 +3123,7 @@ void RISCVDmr::protectBranches() {
                     // with conditional branching
         }
 
-        llvm::MachineInstr *si;
+        llvm::MachineInstr *si = nullptr;
 
         // fall-through path dup
 
@@ -3153,10 +3154,11 @@ void RISCVDmr::protectBranches() {
         }
         MF_->insert(mbb, nemesis_nottaken_BB);
 
-        si = MF_->CloneMachineInstr(MI);
-        for (auto &o : si->operands()) {
-          if (o.isReg()) {
-            o.setReg(P2S_.at(o.getReg()));
+        if (!shadow_predicate) {
+          si = MF_->CloneMachineInstr(MI);
+          for (auto &o : si->operands()) {
+            if (o.isReg())
+              o.setReg(P2S_.at(o.getReg()));
           }
         }
 
@@ -3175,8 +3177,14 @@ void RISCVDmr::protectBranches() {
         riscv_common::rsmFunctionInfo(*MF_).duplicate_blocks.insert(
             nemesis_nottaken_BB);
 
-        si->getOperand(2).setMBB(err_bb_);
-        nemesis_nottaken_BB->push_back(si);
+        if (shadow_predicate) {
+          llvm::BuildMI(*nemesis_nottaken_BB, nemesis_nottaken_BB->end(),
+                        MI->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
+              .addMBB(nottaken_BB);
+        } else {
+          si->getOperand(2).setMBB(err_bb_);
+          nemesis_nottaken_BB->push_back(si);
+        }
 
         // taken path dup
         auto nemesis_taken_BB{
@@ -3188,12 +3196,18 @@ void RISCVDmr::protectBranches() {
         riscv_common::rsmFunctionInfo(*MF_).duplicate_blocks.insert(
             nemesis_taken_BB);
 
-        si = MF_->CloneMachineInstr(si);
-        si->getOperand(2).setMBB(taken_BB);
         MI->getOperand(2).setMBB(nemesis_taken_BB);
-        nemesis_taken_BB->insert(nemesis_taken_BB->begin(), si);
+        if (shadow_predicate) {
+          llvm::BuildMI(*nemesis_taken_BB, nemesis_taken_BB->end(),
+                        MI->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
+              .addMBB(taken_BB);
+        } else {
+          si = MF_->CloneMachineInstr(si);
+          si->getOperand(2).setMBB(taken_BB);
+          nemesis_taken_BB->insert(nemesis_taken_BB->begin(), si);
+        }
         llvm::BuildMI(*nemesis_taken_BB, nemesis_taken_BB->end(),
-                      si->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
+                      MI->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
             .addMBB(err_bb_);
       } else if (MI->isIndirectBranch()) {
         llvm::outs()
@@ -3204,6 +3218,8 @@ void RISCVDmr::protectBranches() {
       }
     }
   } else if (config_.psb == ProtectStrategyBranch::B3) { // nemesec
+    const bool naive = riscv_common::usesRacfedNaiveBranches(*MF_);
+    const bool omit_direction_checks = shadow_predicate || naive;
     for (auto MI : branches_) {
       if (MI->isUnconditionalBranch()) {
         llvm::MachineBasicBlock::iterator insert{MI->getIterator()};
@@ -3216,6 +3232,10 @@ void RISCVDmr::protectBranches() {
 
         assert(MI->getOperand(2).isMBB() && "this branch is odd!");
         auto taken_BB{MI->getOperand(2).getMBB()};
+
+        if (naive)
+          llvm::outs() << "COMPAS_RACFED_NAIVE_SITE function=" << fname_
+                       << " block=" << MBB->getNumber() << "\n";
 
         auto nottaken_BB{MBB->getFallThrough()};
         if (nottaken_BB == nullptr) {
@@ -3241,10 +3261,13 @@ void RISCVDmr::protectBranches() {
         auto nemesec_nottaken_BB{
             MF_->CreateMachineBasicBlock()}; // MBB->getBasicBlock())};
         MF_->insert(MF_->end(), nemesec_nottaken_BB);
-        auto si{MF_->CloneMachineInstr(MI)};
-        for (auto &o : si->operands()) {
-          if (o.isReg()) {
-            o.setReg(P2S_.at(o.getReg()));
+        llvm::MachineInstr *si = nullptr;
+        if (!omit_direction_checks) {
+          si = MF_->CloneMachineInstr(MI);
+          for (auto &o : si->operands()) {
+            if (o.isReg()) {
+              o.setReg(P2S_.at(o.getReg()));
+            }
           }
         }
 
@@ -3256,11 +3279,13 @@ void RISCVDmr::protectBranches() {
         riscv_common::rsmFunctionInfo(*MF_).duplicate_blocks.insert(
             nemesec_nottaken_BB);
 
-        si->getOperand(2).setMBB(err_bb_);
-        nemesec_nottaken_BB->push_back(si);
+        if (!omit_direction_checks) {
+          si->getOperand(2).setMBB(err_bb_);
+          nemesec_nottaken_BB->push_back(si);
+        }
         llvm::MachineBasicBlock::iterator insert =
             nemesec_nottaken_BB->instr_end();
-        llvm::BuildMI(*si->getParent(), insert, si->getDebugLoc(),
+        llvm::BuildMI(*nemesec_nottaken_BB, insert, MI->getDebugLoc(),
                       TII_->get(llvm::RISCV::PseudoBR))
             .addMBB(nottaken_BB); // we need to jump back to fallthrough
         insert = MI->getIterator();
@@ -3278,12 +3303,21 @@ void RISCVDmr::protectBranches() {
         riscv_common::rsmFunctionInfo(*MF_).duplicate_blocks.insert(
             nemesis_taken_BB);
 
-        si = MF_->CloneMachineInstr(si);
-        si->getOperand(2).setMBB(taken_BB);
         MI->getOperand(2).setMBB(nemesis_taken_BB);
-        nemesis_taken_BB->insert(nemesis_taken_BB->begin(), si);
+        if (omit_direction_checks) {
+          // Keep B3's bridge and error guard in both ablations. Predication
+          // checks independently selected intent; the naive control does not.
+          // Only replace the shadow decision with an ordinary transfer.
+          llvm::BuildMI(*nemesis_taken_BB, nemesis_taken_BB->end(),
+                        MI->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
+              .addMBB(taken_BB);
+        } else {
+          si = MF_->CloneMachineInstr(si);
+          si->getOperand(2).setMBB(taken_BB);
+          nemesis_taken_BB->insert(nemesis_taken_BB->begin(), si);
+        }
         llvm::BuildMI(*nemesis_taken_BB, nemesis_taken_BB->end(),
-                      si->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
+                      MI->getDebugLoc(), TII_->get(llvm::RISCV::PseudoBR))
             .addMBB(err_bb_);
       } else if (MI->isIndirectBranch()) {
         llvm::outs()

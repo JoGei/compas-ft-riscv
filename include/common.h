@@ -173,6 +173,8 @@ llvm::MachineInstr *emitSoftBranchPredicate(llvm::MachineInstr &before,
 // consume it to add falseAdjustment or trueAdjustment to signature, using only
 // base integer instructions. The caller owns register reservation, predicate
 // integrity and instruction spacing. Return the final signature ADD.
+// Prepare the complete selected nonzero adjustment in scratch, then add it to
+// the signature once. The two edge adjustments must also be distinct.
 llvm::MachineInstr *emitPredicateSelectedAdd(llvm::MachineInstr &before,
                                             llvm::Register signature,
                                             llvm::Register scratch,

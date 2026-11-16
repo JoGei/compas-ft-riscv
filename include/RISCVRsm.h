@@ -33,6 +33,11 @@ struct RsmFunctionInfo {
   std::set<const llvm::MachineBasicBlock *> error_blocks;
 };
 
+// The selected monitor supplies an independent shadow direction decision.
+// DMR may replace its redundant branch only when this capability is enabled.
+bool usesRsmShadowPredicate(const llvm::MachineFunction &MF);
+// Matched ablation: retain B3 transfer guards but omit its shadow decisions.
+bool usesRacfedNaiveBranches(const llvm::MachineFunction &MF);
 RsmFunctionInfo &rsmFunctionInfo(llvm::MachineFunction &MF);
 void captureOriginalRsmInstructions(llvm::MachineFunction &MF);
 void recordNewRsmInstructions(llvm::MachineFunction &MF, RsmCategory category);

@@ -18,6 +18,7 @@
 #include "RISCVSubtarget.h"
 
 #include "common.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -39,6 +40,26 @@ llvm::cl::opt<std::string> enable_racfed_compasec{
     llvm::cl::desc("CompaSeC RACFED policy: orig+dmr regions, all-class ledger, nonzero post-instruction updates from one instruction; requires RACFED for the same functions"),
     llvm::cl::value_desc("functions")};
 
+llvm::cl::opt<std::string> enable_racfed_predicate{
+    "RACFED-predicate",
+    llvm::cl::desc("Unpadded RV32 primary-predicate signature selection; "
+                   "requires RACFED for the same functions"),
+    llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<std::string> enable_racfed_predicate_shadow{
+    "RACFED-predicate-shadow",
+    llvm::cl::desc("Unpadded RV32 shadow-predicate direction checks; "
+                   "predicate accounting follows the RACFED policy; requires "
+                   "RACFED and an NZDC variant with CGS; enables predication"),
+    llvm::cl::value_desc("functions")};
+
+llvm::cl::opt<std::string> enable_racfed_naive_branches{
+    "RACFED-naive-branches",
+    llvm::cl::desc("Matched unpredicated RACFED ablation: omit B3 shadow "
+                   "direction checks while retaining transfer guards; requires "
+                   "RACFED-compasec and NZDC+NEMESEC with CGS"),
+    llvm::cl::value_desc("functions")};
+
 llvm::cl::opt<std::string> enable_rasm_predicate{
     "RASM-predicate",
     llvm::cl::desc("RV32 equality-predicate signature selection; requires RASM for the same functions"),
@@ -46,12 +67,12 @@ llvm::cl::opt<std::string> enable_rasm_predicate{
 
 llvm::cl::opt<std::string> enable_rasm_predicate_unpadded{
     "RASM-predicate-unpadded",
-    llvm::cl::desc("Omit predicate-to-branch and successor-entry NOP spacing; requires RASM-predicate for the same functions"),
+    llvm::cl::desc("Omit predicate-to-branch and successor-entry NOP spacing; requires RASM-predicate or RASM-predicate-shadow for the same functions"),
     llvm::cl::value_desc("functions")};
 
 llvm::cl::opt<std::string> enable_rasm_predicate_shadow{
     "RASM-predicate-shadow",
-    llvm::cl::desc("Derive predicates from NZDC shadow operands; requires RASM-predicate and plain NZDC with CGS for the same functions"),
+    llvm::cl::desc("Derive predicates from NZDC shadow operands; requires RASM and an NZDC variant with CGS; enables predication"),
     llvm::cl::value_desc("functions")};
 
 llvm::cl::opt<std::string> enable_rasm_predicate_xpred{
@@ -103,13 +124,13 @@ bool is_error_block(const llvm::MachineBasicBlock &MBB) {
   return MBB.succ_size() == 1 && *MBB.succ_begin() == &MBB;
 }
 
-void validate_predicate_cfg(const llvm::MachineFunction &MF,
+void validate_predicate_cfg(llvm::MachineFunction &MF,
                             bool allow_detector_blocks,
                             const riscv_common::RsmRegions *regions = nullptr) {
+  const auto &instructions = riscv_common::rsmFunctionInfo(MF).instructions;
   for (const auto &MBB : MF) {
-    // Original self-loop blocks are rejected before DMR. Plain NZDC only
-    // creates its terminal error block; branches to it are detector checks,
-    // not application predicates requiring signature selection.
+    // DMR terminal error blocks and detector branches do not select
+    // application intent. They are checked through the ordinary monitor.
     if (allow_detector_blocks && is_error_block(MBB))
       continue;
     if (regions && regions->isTransparent(&MBB))
@@ -126,7 +147,10 @@ void validate_predicate_cfg(const llvm::MachineFunction &MF,
       auto *target = direct_branch_target(MI);
       if (allow_detector_blocks && target && is_error_block(*target))
         continue;
-      if (regions && !regions->monitorsBranch(MI))
+      const auto original = instructions.find(&MI);
+      if (regions && (!regions->monitorsBranch(MI) ||
+                      original == instructions.end() ||
+                      original->second != riscv_common::RsmCategory::Original))
         continue;
       auto predicate = riscv_common::getSoftBranchPredicate(MI);
       if (!predicate)
@@ -160,6 +184,129 @@ RISCVRasm::RISCVRasm() : RISCVDmr{} {}
 
 RISCVRacfed::RISCVRacfed() : RISCVRasm{} {}
 
+bool riscv_common::usesRsmShadowPredicate(const llvm::MachineFunction &MF) {
+  const std::string name{MF.getName()};
+  return inCSString(enable_rasm_predicate_shadow, name) ||
+         inCSString(enable_racfed_predicate_shadow, name);
+}
+
+bool riscv_common::usesRacfedNaiveBranches(const llvm::MachineFunction &MF) {
+  return inCSString(enable_racfed_naive_branches, std::string{MF.getName()});
+}
+
+namespace {
+
+void validatePredicateComposition(const llvm::MachineFunction &MF,
+                                  llvm::StringRef mode, bool shadow,
+                                  const std::string &monitor_selection,
+                                  bool after_dmr) {
+  const std::string name{MF.getName()};
+  const auto selected = [&](const std::string &functions) {
+    return riscv_common::inCSString(functions, name);
+  };
+  const auto fail = [&](llvm::StringRef reason) {
+    llvm::report_fatal_error(llvm::Twine("COMPAS: ") + mode + reason);
+  };
+  const unsigned dmr_modes = unsigned(selected(llvm::cl::enable_nzdc)) +
+                            unsigned(selected(llvm::cl::enable_nzdc_nemesis)) +
+                            unsigned(selected(llvm::cl::enable_nzdc_nemesec));
+  if (dmr_modes > 1 || selected(llvm::cl::enable_swift) ||
+      selected(llvm::cl::enable_eddi) || llvm::cl::enable_repair)
+    fail(" supports at most one NZDC variant: NZDC, NZDC+NEMESIS or NZDC+NEMESEC");
+  if (shadow && !dmr_modes)
+    fail(" shadow operands require NZDC, NZDC+NEMESIS or NZDC+NEMESEC");
+  if (selected(llvm::cl::enable_fgs))
+    fail(" requires CGS; FGS is unsupported");
+  const unsigned mask = riscv_common::getRsmInstructionMask(MF, monitor_selection);
+  if (!(mask & static_cast<unsigned>(riscv_common::RsmCategory::Original)))
+    fail(" requires monitoring original application branches (orig)");
+  const auto &ST = MF.getSubtarget<llvm::RISCVSubtarget>();
+  if (ST.is64Bit() || ST.hasStdExtCOrZca())
+    fail(" requires RV32 without compressed instructions");
+  if (after_dmr)
+    return;
+
+  // Inspect application code before DMR adds checking branches or bridges.
+  const auto *TII = ST.getInstrInfo();
+  for (const auto &MBB : MF) {
+    if (MBB.empty() || (&MBB != &MF.front() && MBB.pred_empty()) ||
+        is_error_block(MBB))
+      fail(" does not support empty, unreachable "
+           "or self-loop application blocks");
+    unsigned conditionals = 0;
+    for (const auto &MI : MBB) {
+      if (MI.isInlineAsm())
+        fail(" does not support inline assembly");
+      if ((MI.isCall() && !is_local_unconditional_jump(MI)) ||
+          TII->isTailCall(MI))
+        fail(" requires leaf functions, including no tail calls");
+      if (MI.isIndirectBranch() && !MI.isReturn())
+        fail(" does not support indirect branches");
+      for (const auto &MO : MI.operands())
+        if (MO.isReg() &&
+            (MO.getReg() == llvm::RISCV::X5 || MO.getReg() == llvm::RISCV::X29))
+          fail(" input uses reserved signature "
+               "or predicate register x5/x29");
+      if (!MI.isConditionalBranch())
+        continue;
+      const auto predicate = riscv_common::getSoftBranchPredicate(MI);
+      if (!predicate)
+        fail(" supports only direct BEQ/BNE register branches");
+      if (++conditionals != 1)
+        fail(" requires one application conditional branch per block");
+      const auto next_block = std::next(MBB.getIterator());
+      const llvm::MachineBasicBlock *fallthrough =
+          next_block == MF.end() ? nullptr : &*next_block;
+      bool explicit_fallthrough = false;
+      for (auto I = std::next(MI.getIterator()); I != MBB.end(); ++I) {
+        if (I->isDebugInstr())
+          continue;
+        if (explicit_fallthrough || !is_local_unconditional_jump(*I))
+          fail(" requires a terminal conditional "
+               "with at most one explicit fallthrough jump");
+        fallthrough = direct_branch_target(*I);
+        explicit_fallthrough = true;
+      }
+      if (!fallthrough || !MBB.isSuccessor(fallthrough) ||
+          fallthrough == predicate->taken)
+        fail(" requires distinct taken and fallthrough successors");
+    }
+  }
+}
+
+
+} // namespace
+
+void validateRacfedPredicateOptions(const llvm::MachineFunction &MF,
+                                    bool after_dmr) {
+  const std::string name{MF.getName()};
+  const auto selected = [&](const std::string &functions) {
+    return riscv_common::inCSString(functions, name);
+  };
+  const bool naive = riscv_common::usesRacfedNaiveBranches(MF);
+  const bool shadow = selected(enable_racfed_predicate_shadow);
+  const bool predicate = selected(enable_racfed_predicate) || shadow;
+  if (naive && predicate)
+    llvm::report_fatal_error(
+        "COMPAS: RACFED-naive-branches cannot compose with RACFED predicates");
+  if (!predicate && !naive)
+    return;
+  const llvm::StringRef mode = naive ? "RACFED-naive-branches" : "RACFED-predicate";
+  const auto fail = [&](llvm::StringRef reason) {
+    llvm::report_fatal_error(llvm::Twine("COMPAS: ") + mode + reason);
+  };
+  if (!selected(llvm::cl::enable_racfed))
+    fail(" requires RACFED for the same function");
+  if (naive && !selected(enable_racfed_compasec))
+    fail(" requires RACFED-compasec for the matched ablation");
+  if (selected(llvm::cl::enable_rasm) || selected(llvm::cl::enable_cfcss))
+    fail(" cannot compose with another signature monitor");
+  if (naive && !selected(llvm::cl::enable_nzdc_nemesec))
+    fail(" requires NZDC+NEMESEC composition with RACFED-compasec");
+  validatePredicateComposition(MF, mode, shadow,
+                               llvm::cl::enable_racfed.getValue(), after_dmr);
+}
+
 void validateRacfedCompaSeCOptions(const llvm::MachineFunction &MF) {
   const std::string name{MF.getName()};
   if (!riscv_common::inCSString(enable_racfed_compasec, name))
@@ -189,72 +336,29 @@ void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
   const auto selected = [&](const std::string &functions) {
     return riscv_common::inCSString(functions, name);
   };
-  const bool predicate = selected(enable_rasm_predicate);
-  const bool unpadded = selected(enable_rasm_predicate_unpadded);
   const bool shadow = selected(enable_rasm_predicate_shadow);
+  const bool predicate = selected(enable_rasm_predicate) || shadow;
+  const bool unpadded = selected(enable_rasm_predicate_unpadded);
   const bool xpred = selected(enable_rasm_predicate_xpred);
   const bool psp_simm6 = selected(enable_rasm_predicate_psp_simm6);
-  if (!predicate && (unpadded || shadow || xpred || psp_simm6))
+  if (!predicate && (unpadded || xpred || psp_simm6))
     llvm::report_fatal_error(
-        "COMPAS: RASM predicate modifiers (unpadded, shadow, xpred, psp-simm6) require "
-        "RASM-predicate for the same function");
+        "COMPAS: RASM predicate modifiers require RASM-predicate "
+        "or RASM-predicate-shadow for the same function");
   if (!predicate)
     return;
-
   if (!selected(llvm::cl::enable_rasm))
     llvm::report_fatal_error(
         "COMPAS: RASM-predicate requires RASM for the same function");
-  const auto &ST = MF.getSubtarget<llvm::RISCVSubtarget>();
-  if (ST.is64Bit() || ST.hasStdExtCOrZca())
+  if (selected(llvm::cl::enable_racfed) || selected(llvm::cl::enable_cfcss))
     llvm::report_fatal_error(
-        "COMPAS: RASM-predicate requires RV32 without compressed instructions");
+        "COMPAS: RASM-predicate cannot compose with another signature monitor");
+  validatePredicateComposition(MF, "RASM-predicate", shadow,
+                               llvm::cl::enable_rasm.getValue(), after_dmr);
   if (xpred && !riscv_common::getXPredSelectiveAccumulateOpcode(MF))
     llvm::report_fatal_error(
         "COMPAS: RASM-predicate-xpred requires an XPred-enabled LLVM build "
         "and the +xpred function feature");
-  if (selected(llvm::cl::enable_nzdc_nemesis) ||
-      selected(llvm::cl::enable_nzdc_nemesec) ||
-      selected(llvm::cl::enable_swift) || selected(llvm::cl::enable_eddi) ||
-      llvm::cl::enable_repair || selected(llvm::cl::enable_cfcss) ||
-      selected(llvm::cl::enable_racfed))
-    llvm::report_fatal_error(
-        "COMPAS: RASM-predicate only supports plain NZDC composition; "
-        "NEMESIS, NEMESEC, SWIFT, EDDI, REPAIR, CFCSS and RACFED are unsupported");
-  if (selected(llvm::cl::enable_nzdc) && selected(llvm::cl::enable_fgs))
-    llvm::report_fatal_error(
-        "COMPAS: RASM-predicate with NZDC requires CGS; FGS is unsupported");
-  if (shadow && !selected(llvm::cl::enable_nzdc))
-    llvm::report_fatal_error(
-        "COMPAS: RASM-predicate-shadow requires plain NZDC with CGS for the "
-        "same function");
-
-  // The first COMPAS hook validates original code. DMR-generated detector
-  // branches and shadow operands are validated separately after that pass.
-  if (after_dmr && selected(llvm::cl::enable_nzdc))
-    return;
-
-  const auto *TII = ST.getInstrInfo();
-  for (const auto &MBB : MF) {
-    for (const auto &MI : MBB) {
-      if (MI.isInlineAsm())
-        llvm::report_fatal_error(
-            "COMPAS: RASM-predicate prototype does not support inline assembly");
-      if ((MI.isCall() && !is_local_unconditional_jump(MI)) ||
-          TII->isTailCall(MI))
-        llvm::report_fatal_error(
-            "COMPAS: RASM-predicate prototype requires leaf functions, "
-            "including no tail calls");
-      for (const auto &operand : MI.operands()) {
-        if (operand.isReg() &&
-            (operand.getReg() == llvm::RISCV::X5 ||
-             operand.getReg() == llvm::RISCV::X29))
-          llvm::report_fatal_error(
-              "COMPAS: RASM-predicate input uses reserved signature or "
-              "predicate register x5/x29");
-      }
-    }
-  }
-  validate_predicate_cfg(MF, false);
 }
 
 bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
@@ -262,7 +366,8 @@ bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   TII_ = MF_->getSubtarget().getInstrInfo();
-  predicate_mode_ = riscv_common::inCSString(enable_rasm_predicate, fname_);
+  predicate_mode_ = riscv_common::inCSString(enable_rasm_predicate, fname_) ||
+                    riscv_common::inCSString(enable_rasm_predicate_shadow, fname_);
   predicate_unpadded_ =
       riscv_common::inCSString(enable_rasm_predicate_unpadded, fname_);
   predicate_shadow_mode_ =
@@ -290,9 +395,36 @@ bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
   return true;
 }
 
+bool RISCVRasm::is_predicate_branch(const llvm::MachineInstr &MI) const {
+  const auto &instructions = riscv_common::rsmFunctionInfo(*MF_).instructions;
+  const auto found = instructions.find(&MI);
+  return MI.isConditionalBranch() && regions_->monitorsBranch(MI) &&
+         found != instructions.end() &&
+         found->second == riscv_common::RsmCategory::Original;
+}
+
+riscv_common::SoftBranchPredicate
+RISCVRasm::predicate_operands(const llvm::MachineInstr &MI) const {
+  auto predicate = riscv_common::getSoftBranchPredicate(MI);
+  if (!predicate)
+    llvm::report_fatal_error("COMPAS: predicate lost its application BEQ/BNE");
+  if (predicate_shadow_mode_) {
+    const auto shadow_source = [&](llvm::Register source) {
+      const auto pair = P2S_.find(source);
+      if (pair == P2S_.end() || pair->second == kRTS || pair->second == kC)
+        llvm::report_fatal_error(
+            "COMPAS: shadow predicate requires independent mapped NZDC operands");
+      return pair->second;
+    };
+    // Include NZDC's faultable shadow-zero register, not architectural x0.
+    predicate->lhs = shadow_source(predicate->lhs);
+    predicate->rhs = shadow_source(predicate->rhs);
+  }
+  return *predicate;
+}
+
 void RISCVRasm::validate_predicate_mode() {
-  validate_predicate_cfg(*MF_,
-      riscv_common::inCSString(llvm::cl::enable_nzdc, fname_), regions_.get());
+  validate_predicate_cfg(*MF_, true, regions_.get());
 }
 
 void RISCVRasm::finalizePredicateLayout() {
@@ -356,6 +488,8 @@ void RISCVRasm::init() {
   mbb_sum_ii_sigs_.clear();
   mbb_signature_arbr_instrs_.clear();
   mbb_signature_check_instrs_.clear();
+  prepared_predicate_masks_.clear();
+  predicate_computations_.clear();
   cf_err_bb_ = nullptr;
   err_bbs_.clear();
   config_.eds = riscv_common::ErrorDetectionStrategy::ED3; // TODO: should be
@@ -370,13 +504,63 @@ void RISCVRasm::init() {
   }
 }
 
+bool RISCVRasm::valid_predicate_exit(llvm::MachineBasicBlock &MBB,
+                                     int signature) const {
+  if (!predicate_mode_)
+    return true;
+  for (const auto &MI : MBB) {
+    if (!is_predicate_branch(MI))
+      continue;
+    const auto *taken = regions_->resolve(direct_branch_target(MI));
+    const auto *fallthrough = regions_->resolve(MBB.getFallThrough());
+    if (!taken || !fallthrough || taken == fallthrough)
+      llvm::report_fatal_error(
+          "COMPAS: predicate allocation requires distinct normal successors");
+    const auto entry = [&](const llvm::MachineBasicBlock *block) {
+      const auto labels = mbb_sigs_.at(block);
+      return int(labels.first) + labels.second;
+    };
+    const int delta_t = entry(taken) - signature;
+    const int delta_f = entry(fallthrough) - signature;
+    if (!delta_t || !delta_f || delta_t == delta_f ||
+        !llvm::isInt<12>(delta_t) || !llvm::isInt<12>(delta_f) ||
+        !llvm::isInt<12>(delta_t - delta_f))
+      return false;
+  }
+  return true;
+}
+
+void RISCVRasm::generate_signatures_with_predicate_constraints() {
+  // A zero ledger is valid under RASM and under RACFED's coverage/threshold
+  // policies. Ensure its exit X_b has two nonzero adjustments. Active RACFED
+  // ledgers apply the same predicate constraint to their actual X_b + U_b.
+  constexpr unsigned MaxAttempts = 32;
+  for (unsigned attempt = 1; attempt <= MaxAttempts; ++attempt) {
+    mbb_sigs_.clear();
+    generate_signatures();
+    if (!predicate_mode_ ||
+        std::all_of(MF_->begin(), MF_->end(),
+                    [&](llvm::MachineBasicBlock &MBB) {
+                      const auto labels = mbb_sigs_.find(&MBB);
+                      return labels == mbb_sigs_.end() ||
+                             valid_predicate_exit(MBB, labels->second.first);
+                    }))
+      return;
+    llvm::outs() << "COMPAS_PREDICATE_LABEL_RETRY function=" << fname_
+                 << " attempt=" << attempt << "\n";
+  }
+  llvm::report_fatal_error(
+      "COMPAS: predicate allocation could not obtain nonzero edge "
+      "adjustments within 32 attempts");
+}
+
 // RASM hardening scheme
 void RISCVRasm::harden() {
 
   //////////////////////////////////////////////////////////////////////////////
   // Step 1: Assign compile time signatues and random arbitration value
   // "subRanPrevVal" to each basic block of the function.
-  generate_signatures();
+  generate_signatures_with_predicate_constraints();
 
   //////////////////////////////////////////////////////////////////////////////
   // Step 2: Insert runtime signature arbitration and signature check in the
@@ -718,7 +902,7 @@ bool RISCVRasm::try_generate_psp_simm6_signatures() {
         normal_predecessors[found->second].insert(source);
     }
     for (const auto &MI : MBB) {
-      if (!MI.isConditionalBranch() || !regions_->monitorsBranch(MI))
+      if (!is_predicate_branch(MI))
         continue;
       const auto *taken = regions_->resolve(direct_branch_target(MI));
       if (!taken || index.find(taken) == index.end())
@@ -1051,32 +1235,59 @@ void RISCVRasm::generate_traversal_adjustments() {
         assert(target && "monitored branch has no normal destination!");
 
         const auto target_adjustment = calculate_adjustment(&MBB, target);
-        if (predicate_mode_ && regions_->monitorsBranch(*MI)) {
+        if (predicate_mode_ && is_predicate_branch(*MI)) {
           auto *fallthrough = regions_->resolve(MBB.getFallThrough());
           if (!fallthrough || fallthrough == target ||
               err_bbs_.count(fallthrough) || carried_adjustment)
             llvm::report_fatal_error("COMPAS: unsupported RASM-predicate successor adjustment");
           const auto false_adjustment = calculate_adjustment(&MBB, fallthrough);
-          auto predicate = riscv_common::getSoftBranchPredicate(*MI);
-          if (!predicate)
+          if (!false_adjustment || !target_adjustment ||
+              false_adjustment == target_adjustment)
             llvm::report_fatal_error(
-                "COMPAS: RASM-predicate lost its application BEQ/BNE");
-          if (predicate_shadow_mode_) {
-            const auto shadow_source = [&](llvm::Register source) {
-              const auto pair = P2S_.find(source);
-              if (pair == P2S_.end() || pair->second == kRTS ||
-                  pair->second == kC)
-                llvm::report_fatal_error(
-                    "COMPAS: RASM-predicate-shadow requires a mapped NZDC "
-                    "primary operand with an independent shadow register");
-              return pair->second;
-            };
-            // Map x0 too: NZDC's shadow zero is the faultable x27 stream,
-            // not the architectural zero used by the primary branch.
-            predicate->lhs = shadow_source(predicate->lhs);
-            predicate->rhs = shadow_source(predicate->rhs);
+                "COMPAS: predicate-selected add requires distinct nonzero edge adjustments");
+          const auto prepared = prepared_predicate_masks_.find(MI);
+          if (prepared != prepared_predicate_masks_.end()) {
+            // Four software predicate helpers and their nonzero updates
+            // are already included in U_b.
+            // Select the edge only after that ledger is complete.
+            const int difference = target_adjustment - false_adjustment;
+            if (!llvm::isInt<12>(false_adjustment) ||
+                !llvm::isInt<12>(difference))
+              llvm::report_fatal_error(
+                  "COMPAS: RACFED-predicate-shadow base and difference must "
+                  "fit signed 12-bit immediates");
+            prepared->second->getOperand(2).setImm(difference);
+            llvm::BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
+                          TII_->get(llvm::RISCV::ADDI))
+                // Finish the complete edge adjustment in scratch, then
+                // change RTS once. This pair remains monitor infrastructure.
+                .addDef(kC)
+                .addReg(kC)
+                .addImm(false_adjustment);
+            llvm::BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
+                          TII_->get(llvm::RISCV::ADD))
+                .addDef(kRTS)
+                .addReg(kRTS)
+                .addReg(kC);
+            ++predicate_sites_;
+            llvm::outs() << "COMPAS_RACFED_PREDICATE_SITE function=" << fname_
+                         << " block=" << MBB.getNumber()
+                         << " taken=" << target->getNumber()
+                         << " fallthrough=" << fallthrough->getNumber()
+                         << " true=" << target_adjustment
+                         << " false=" << false_adjustment
+                         << " difference=" << difference
+                         << " sum=" << mbb_sum_ii_sigs_.at(&MBB);
+            llvm::outs() << "\n";
+            carried_adjustment = false_adjustment;
+            continue;
           }
-          riscv_common::emitSoftBranchPredicate(*MI, *predicate, kC);
+          if (riscv_common::inCSString(llvm::cl::enable_racfed, fname_))
+            llvm::report_fatal_error(
+                "COMPAS: RACFED-predicate-shadow encountered an unplanned "
+                "application branch");
+          const auto predicate = predicate_operands(*MI);
+          riscv_common::emitSoftBranchPredicate(*MI, predicate, kC);
           const bool simm6_fit = llvm::isInt<6>(false_adjustment) &&
                                   llvm::isInt<6>(target_adjustment);
           ++predicate_sites_;
@@ -1211,9 +1422,17 @@ void RISCVRasm::generate_traversal_adjustments() {
 
 bool RISCVRacfed::runOnMachineFunction(llvm::MachineFunction &MF) {
   validateRacfedCompaSeCOptions(MF);
+  validateRacfedPredicateOptions(MF, true);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   TII_ = MF_->getSubtarget().getInstrInfo();
+  predicate_shadow_mode_ =
+      riscv_common::inCSString(enable_racfed_predicate_shadow, fname_);
+  predicate_mode_ = riscv_common::inCSString(enable_racfed_predicate, fname_) ||
+                    predicate_shadow_mode_;
+  predicate_unpadded_ = predicate_mode_;
+  predicate_xpred_mode_ = false;
+  predicate_psp_simm6_ = false;
 
   if (!riscv_common::inCSString(llvm::cl::enable_racfed,
                                 std::string{MF_->getName()})) {
@@ -1235,6 +1454,8 @@ bool RISCVRacfed::runOnMachineFunction(llvm::MachineFunction &MF) {
     regions_ = std::make_unique<riscv_common::RsmRegions>(
         *MF_, llvm::cl::enable_racfed.getValue());
   }
+  if (predicate_mode_)
+    validate_predicate_mode();
   init();
 
   llvm::outs() << "Running RACFED harden() on " << MF_->getName() << "\n";
@@ -1242,6 +1463,47 @@ bool RISCVRacfed::runOnMachineFunction(llvm::MachineFunction &MF) {
   harden();
 
   return true;
+}
+
+void RISCVRacfed::prepare_predicates() {
+  std::vector<llvm::MachineInstr *> branches;
+  for (auto &MBB : *MF_)
+    for (auto &MI : MBB)
+      if (is_predicate_branch(MI))
+        branches.push_back(&MI);
+  for (auto *branch : branches) {
+    const auto predicate = predicate_operands(*branch);
+    auto &MBB = *branch->getParent();
+    auto *fallthrough = regions_->resolve(MBB.getFallThrough());
+    if (!fallthrough || fallthrough == regions_->resolve(predicate.taken))
+      llvm::report_fatal_error("COMPAS: RACFED-predicate requires "
+                              "distinct normalized branch successors");
+    auto *boolean =
+        riscv_common::emitSoftBranchPredicate(*branch, predicate, kC);
+    auto *difference = &*std::prev(boolean->getIterator());
+    auto *mask =
+        llvm::BuildMI(MBB, branch->getIterator(), branch->getDebugLoc(),
+                      TII_->get(llvm::RISCV::SUB))
+            .addDef(kC)
+            .addReg(riscv_common::k0)
+            .addReg(kC)
+            .getInstr();
+    auto *selection =
+        llvm::BuildMI(MBB, branch->getIterator(), branch->getDebugLoc(),
+                      TII_->get(llvm::RISCV::ANDI))
+            .addDef(kC)
+            .addReg(kC)
+            .addImm(0) // Patched after the complete intra-block ledger.
+            .getInstr();
+    for (auto *MI : {difference, boolean, mask, selection}) {
+      // Explicit provenance admits only these generated computations. The
+      // final edge ADDI/ADD and monitor infrastructure remain unclassified.
+      riscv_common::setRsmInstructionCategory(*MI,
+                                              riscv_common::RsmCategory::Dmr);
+      predicate_computations_.insert(MI);
+    }
+    prepared_predicate_masks_.emplace(branch, selection);
+  }
 }
 
 void RISCVRacfed::init() {
@@ -1345,6 +1607,34 @@ void RISCVRacfed::generate_intrablock_signature_updates() {
 
     mbb_sum_ii_sigs_[&MBB] = 0; // force to 0
 
+    unsigned emitted = 0;
+    const short entry = mbb_sigs_.at(&MBB).first;
+    if (predicate_mode_ &&
+        orig_instrs.size() >= N_MIN_INTRA_INSTRUCTION_COUNT &&
+        !valid_predicate_exit(MBB, entry + sum_ii_rvs)) {
+      const auto last = std::find_if(
+          orig_instrs.rbegin(), orig_instrs.rend(), [&](const auto *MI) {
+            return mi_random_value_.at(&MBB).at(MI) != 0;
+          });
+      if (last == orig_instrs.rend())
+        llvm::report_fatal_error(
+            "COMPAS: RACFED predicate has no allocated update to constrain");
+      auto &update = mi_random_value_.at(&MBB).at(*last);
+      const short previous = update;
+      const int prefix = entry + sum_ii_rvs - previous;
+      std::uniform_int_distribution<int> exits(-1024, 1023);
+      int exit;
+      do {
+        exit = exits(gen_);
+      } while (exit == prefix || !valid_predicate_exit(MBB, exit));
+      update = exit - prefix;
+      assert_imm(update);
+      sum_ii_rvs += update - previous;
+      llvm::outs() << "COMPAS_RACFED_PREDICATE_RETUNE function=" << fname_
+                   << " block=" << MBB.getNumber() << " old=" << previous
+                   << " new=" << update << " sum=" << sum_ii_rvs << "\n";
+    }
+
     if (orig_instrs.size() >= N_MIN_INTRA_INSTRUCTION_COUNT) {
       // There is no point in intra block protection for basic blocks with
       // only 2 or 1 instruction since all intra block errors are also legal
@@ -1354,6 +1644,7 @@ void RISCVRacfed::generate_intrablock_signature_updates() {
         if (rv == 0)
           continue;
 
+        const int before = entry + mbb_sum_ii_sigs_.at(&MBB);
         mbb_sum_ii_sigs_.at(&MBB) += rv;
 
         llvm::outs() << ">adding µi update [" << rv << "] for  "
@@ -1365,7 +1656,39 @@ void RISCVRacfed::generate_intrablock_signature_updates() {
             .addReg(kRTS, llvm::RegState::Define)
             .addReg(kRTS)
             .addImm(rv);
+        if (predicate_mode_) {
+          const auto category =
+              riscv_common::rsmFunctionInfo(*MF_).instructions.at(mi);
+          const char *category_name =
+              predicate_computations_.count(mi)                 ? "predicate"
+              : category == riscv_common::RsmCategory::Original ? "orig"
+              : category == riscv_common::RsmCategory::Dmr      ? "dmr"
+                                                                : "balance";
+          llvm::outs() << "COMPAS_RACFED_UI function=" << fname_
+                       << " block=" << MBB.getNumber() << " ordinal=" << emitted
+                       << " category=" << category_name
+                       << " opcode=" << TII_->getName(mi->getOpcode())
+                       << " delta=" << rv << " before=" << before
+                       << " after=" << entry + mbb_sum_ii_sigs_.at(&MBB)
+                       << " placement=before\n";
+        }
+        ++emitted;
       }
+    }
+    if (predicate_mode_) {
+      if (!valid_predicate_exit(MBB, entry + mbb_sum_ii_sigs_.at(&MBB)))
+        llvm::report_fatal_error("COMPAS: invalid RACFED predicate exit state");
+      const auto zeros = std::count_if(
+          orig_instrs.begin(), orig_instrs.end(), [&](const auto *MI) {
+            return mi_random_value_.at(&MBB).at(MI) == 0;
+          });
+      llvm::outs() << "COMPAS_RACFED_REGION function=" << fname_
+                   << " block=" << MBB.getNumber() << " x=" << entry
+                   << " y=" << mbb_sigs_.at(&MBB).second
+                   << " selected=" << orig_instrs.size()
+                   << " eligible=" << emitted << " zero_initial=" << zeros
+                   << " sum=" << mbb_sum_ii_sigs_.at(&MBB)
+                   << " placement=before\n";
     }
   }
 }
@@ -1415,8 +1738,14 @@ void RISCVRacfed::generate_compasec_intrablock_signature_updates() {
       std::uniform_int_distribution<short> values{-1024 - current,
                                                    1023 - current};
       short update = 0;
-      while (update == 0)
+      // Preserve the normal software RNG choices unless the last helper
+      // would leave RTS equal to a successor entry. Both complete selected
+      // adjustments must change RTS, including the false arm. The exit
+      // domain has 2048 values and excludes at most three here.
+      do {
         update = values(gen_);
+      } while (!update || (MI == eligible.back() &&
+                           !valid_predicate_exit(MBB, current + update)));
       assert_imm(update);
       llvm::BuildMI(MBB, std::next(MI->getIterator()), MI->getDebugLoc(),
                     TII_->get(llvm::RISCV::ADDI))
@@ -1427,8 +1756,10 @@ void RISCVRacfed::generate_compasec_intrablock_signature_updates() {
       sum += update;
       const auto category = provenance.at(MI);
       const char *category_name =
-          category == riscv_common::RsmCategory::Original ? "orig" :
-          category == riscv_common::RsmCategory::Dmr ? "dmr" : "balance";
+          predicate_computations_.count(MI)                 ? "predicate"
+          : category == riscv_common::RsmCategory::Original ? "orig"
+          : category == riscv_common::RsmCategory::Dmr      ? "dmr"
+                                                            : "balance";
       llvm::outs() << "COMPAS_RACFED_UI function=" << fname_
                    << " block=" << MBB.getNumber() << " ordinal=" << ordinal++
                    << " category=" << category_name
@@ -1449,7 +1780,10 @@ void RISCVRacfed::harden() {
   //////////////////////////////////////////////////////////////////////////////
   // Step 1: Assign compile time signatues and random arbitration value
   // "subRanPrevVal" to each basic block of the function.
-  generate_signatures();
+  generate_signatures_with_predicate_constraints();
+
+  if (predicate_mode_)
+    prepare_predicates();
 
   //////////////////////////////////////////////////////////////////////////////
   // Step 2: Now add for all original and trivial instruction the intra block

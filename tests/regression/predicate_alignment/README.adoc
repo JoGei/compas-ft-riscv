@@ -1,0 +1,63 @@
+= Aligned RASM/RACFED software predicates
+
+Run from the COMPAS repository root with a rebuilt LLVM toolchain:
+
+[source,sh]
+----
+python3 tests/regression/predicate_alignment/run.py \
+  --llc /path/to/llvm/bin/llc \
+  --clang /path/to/llvm/bin/clang \
+  --objdump /path/to/llvm/bin/llvm-objdump \
+  --cc /path/to/riscv-none-elf-gcc \
+  --qemu /path/to/qemu-riscv32 \
+  --build-dir build/tests/predicate-alignment
+----
+
+The runner compiles RV32I/ILP32 with `-O1`, disabled relaxation and
+`-verify-machineinstrs`. It runs an unprotected reference and fourteen protected
+configurations against independent literal return-value and volatile-store
+expectations. Both RASM and RACFED are tested with primary predicates alone,
+and with primary or shadow predicates under `NZDC`, `NZDC+NEMESIS`, and
+`NZDC+NEMESEC`. RACFED explicitly selects `RACFED-compasec` to account for all
+instruction classes with nonzero intra-block updates in this first matrix.
+RASM selects its unpadded layout so the two software sequences can be compared
+directly.
+
+A second matrix runs seven RACFED source/DMR combinations under each of the
+legacy coverage masks `orig`, `orig+dmr`, and `all`, without `RACFED-compasec`.
+Software predication does not select a ledger policy implicitly. The legacy
+policy keeps its three-candidate threshold, updates before the selected
+instructions, and exempts an instruction at the first position from its random
+update. Generated predicate helpers belong to the DMR instruction class and
+receive no ledger updates with an `orig`-only mask. The `tiny` fixture exercises
+a below-threshold branch region with zero intra-block contribution.
+The separate `threshold.c` fixture uses argument-based addresses and exactly
+zero, one, two or three volatile loads before its branch. Linked load counts
+independently check the threshold: no updates below three candidates, and two
+updates before the second and third loads at the boundary. Both outcomes also
+run against a literal oracle.
+
+Linked instruction checks establish the selected predicate operand stream,
+including NZDC's shadow zero, distinct nonzero successor adjustments, and a
+single final signature ADD followed by the original branch. Primary predicates
+retain NEMESIS/NEMESEC shadow direction branches; shadow predicates replace
+those branches. RACFED checks also reconcile predicate helpers with its
+instruction ledger, eligible counts and accumulated updates.
+Both policies' linked helper updates must have the requested placement, and
+the final successor adjustments must include exactly the emitted ledger sum.
+
+Mixed-function cases select shadow predication only for the first protected
+function, leaving later functions with their ordinary DMR direction checks.
+Another case alternates CompaSeC and legacy policy selection among predicate
+functions in the same module. An additional function stays entirely unprotected.
+Invalid configurations cover
+missing monitor/DMR, FGS, unsupported relations, calls, RV64 and compressed
+instructions, and coverage masks that exclude original branches while requesting
+replacement of DMR direction checks.
+
+The output directory retains exact commands, compiler diagnostics, linked
+disassembly, runtime traces and `results.json`. These checks establish fault-free
+behavior and compiler structure; they do not establish instruction-skip coverage,
+data-error detection or hardware-predicate behavior.
+In particular, retaining the legacy ledger does not establish CompaSeC-equivalent
+fault coverage.

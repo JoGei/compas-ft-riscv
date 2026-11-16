@@ -1002,6 +1002,10 @@ llvm::MachineInstr *riscv_common::emitPredicateSelectedAdd(
         "COMPAS: predicate-selected add requires distinct nonzero physical "
         "integer signature and scratch registers");
 
+  if (!falseAdjustment || !trueAdjustment || falseAdjustment == trueAdjustment)
+    llvm::report_fatal_error(
+        "COMPAS: predicate-selected add requires distinct nonzero edge adjustments");
+
   // Check the base first so the following bounds cannot overflow int64_t,
   // including when callers pass an arbitrary trueAdjustment.
   if (!llvm::isInt<12>(falseAdjustment) ||
@@ -1026,8 +1030,10 @@ llvm::MachineInstr *riscv_common::emitPredicateSelectedAdd(
       .addReg(scratch)
       .addImm(difference);
   llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::ADDI))
-      .addDef(signature)
-      .addReg(signature)
+      // Prepare the complete selected adjustment before changing RTS. In
+      // particular, skipping the final ADD must not leave a valid false edge.
+      .addDef(scratch)
+      .addReg(scratch)
       .addImm(falseAdjustment);
   return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::ADD))
       .addDef(signature)
@@ -1058,6 +1064,9 @@ std::optional<unsigned> riscv_common::getXPredSelectiveAccumulateOpcode(
 llvm::MachineInstr *riscv_common::tryEmitXPredPredicateSelectedAdd(
     llvm::MachineInstr &before, llvm::Register signature,
     llvm::Register predicate, int64_t falseAdjustment, int64_t trueAdjustment) {
+  if (!falseAdjustment || !trueAdjustment || falseAdjustment == trueAdjustment)
+    llvm::report_fatal_error(
+        "COMPAS: predicate-selected add requires distinct nonzero edge adjustments");
   if (!llvm::isInt<6>(falseAdjustment) || !llvm::isInt<6>(trueAdjustment))
     return nullptr;
   require_insertion_point(before);

@@ -1,0 +1,45 @@
+= Shadow-predicate CompaSeC RACFED regression
+
+Run `python3 run.py --llc <llc> --clang <clang> --objdump <llvm-objdump> --cc <RV32-capable-gcc> --qemu <qemu-riscv32> --build-dir <output>`.
+Use an LLVM 16 COMPAS build implementing `--RACFED-predicate-shadow`.
+The runner uses the Clang-to-IR-to-llc flow, requires machine verification and runtime execution, and retains commands, logs, compiler records, linked disassembly and JSON results.
+
+F selects `NZDC+NEMESEC`, `RACFED` and `RACFED-compasec`.
+G adds `RACFED-predicate-shadow` with the same function list.
+N adds `RACFED-naive-branches` to F instead: it removes only the B3 shadow conditional decisions, retains the same unconditional transfers/error guards, and leaves ordinary unpredicated RACFED edge adjustments.
+It is an intentionally incomplete branch-intent control, not a protection replacement for F.
+All three use RV32I/ILP32, CGS, `-O1`, disabled relaxation and no padding.
+Linked instructions must retain primary-register application branches and B3 unconditional error guards; G's predicate must use shadow registers, including `x27` for architectural `x0`.
+The four helper computations must each have a nonzero following intra-block update.
+The final `ADDI t4,t4,delta_F` prepares the complete adjustment in scratch and `ADD t0,t0,t4` commits it to the runtime signature (RTS) once; neither monitor instruction receives a recursive update.
+The emitted ledger must include all four helper contributions and satisfy the source/target edge-adjustment equations, with distinct nonzero edge adjustments and signed-12-bit base/difference literals.
+
+The literal C oracle covers both outcomes of equality and inequality, 32-bit wrapping arithmetic, register and zero comparisons, ordinary loadback and ordered stores, and a diamond with a shared successor and explicit jumps.
+F, N and G must independently pass this oracle on RV32 user-mode QEMU; the project-level ETISS and RTL campaign is separate.
+N's linked code must retain the entry balance checks, ordinary-store loadback, ordered-store policy, all-class nonzero ledger and the same number of B3 unconditional detector guards as F.
+Its application branch must have an ordinary immediate RTS adjustment, with no shadow conditional branch or predicate helpers.
+For each of the five protected functions, a separate linked-ELF mutation replaces the final RTS ADD and adjacent primary branch with two RV32 NOPs.
+QEMU must execute the CFP detector ECALL at the first affected invocation, reproducing the concrete two-instruction skip boundary that the old split RTS update could bypass.
+This checks one intact-prefix skip window per function, not all possible skip placements or entry states.
+An additional 192-function allocation corpus checks both edge deltas are nonzero and distinct, with representable software immediates.
+Its deterministic legacy allocation included a zero taken delta at clone 168, so this also exercises the new allocator constraint.
+Two additional corpora exercise predicate allocation with the ordinary RACFED
+ledger and no CompaSeC policy. A 192-function shadow corpus triggers initial
+label retry at clone 19. A 1128-function standalone primary corpus reaches a
+last-update collision at clone 1127. The test reconstructs the old exit matching
+a successor entry and checks that replacing an already nonzero update avoids
+both entries without changing ledger eligibility or pre-instruction placement.
+Linked instruction checks and a literal QEMU oracle verify both outcomes of
+that retuned function. These are allocation regressions, not fault-coverage
+comparisons between ledger policies.
+Per-function selection must not affect other F functions.
+Invalid flag combinations, other branch forms, calls and unsupported target configurations must fail explicitly.
+The naive selector requires `NZDC+NEMESEC`, `RACFED`, `RACFED-compasec`, CGS and the same RV32 leaf BEQ/BNE subset; selecting it together with primary or shadow predicate selection fails before DMR mutation.
+Plain `NZDC` is not an equivalent matched ablation because its B0 branch policy also removes B3's transfer guards.
+
+These tests establish compiler structure, fault-free behavior, and the stated concrete skip regressions, not exhaustive skip coverage or protection equivalence.
+
+The broader software composition matrix is in `../predicate_alignment`: both monitors support primary predicates standalone or with an NZDC variant, and shadow predicates with NZDC, NEMESIS or NEMESEC. This suite keeps the specific CompaSeC F/N/G comparison.
+Software predicate selection does not require `RACFED-compasec`; the F/N/G
+comparison requests that policy explicitly. The naive ablation continues to
+require it.

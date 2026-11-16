@@ -25,10 +25,12 @@
 #include "common.h"
 
 // Called by the first COMPAS pipeline hook before other hardening passes can
-// mutate a function selected for the experimental predicate lowering.
+// mutate a function selected for the predicate lowering or naive ablation.
 void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
                                   bool after_dmr = false);
 void validateRacfedCompaSeCOptions(const llvm::MachineFunction &MF);
+void validateRacfedPredicateOptions(const llvm::MachineFunction &MF,
+                                    bool after_dmr = false);
 
 class RISCVRasm : public RISCVDmr {
 public:
@@ -77,6 +79,15 @@ protected:
   unsigned predicate_simm6_sites_{0};
   unsigned predicate_fused_sites_{0};
   unsigned predicate_range_fallbacks_{0};
+  // RACFED plans four software predicate helpers before collecting its
+  // ledger. The map holds the mask instruction patched with the difference.
+  // Signature selection is emitted after the ledger sum is known.
+  std::map<const llvm::MachineInstr *, llvm::MachineInstr *>
+      prepared_predicate_masks_;
+  std::set<const llvm::MachineInstr *> predicate_computations_;
+  bool is_predicate_branch(const llvm::MachineInstr &MI) const;
+  riscv_common::SoftBranchPredicate
+  predicate_operands(const llvm::MachineInstr &MI) const;
   void validate_predicate_mode();
   void validate_predicate_branch_span();
   void generate_predicate_entry_spacing();
@@ -96,6 +107,8 @@ protected:
   bool branches_to_errbbs(const llvm::MachineInstr *mi);
 
   void generate_signatures();
+  void generate_signatures_with_predicate_constraints();
+  bool valid_predicate_exit(llvm::MachineBasicBlock &MBB, int signature) const;
   bool try_generate_psp_simm6_signatures();
   virtual void generate_intrablock_signature_updates();
   void generate_signature_checks();
@@ -128,6 +141,7 @@ protected:
 
 private:
   bool compasec_policy_{false};
+  void prepare_predicates();
   void generate_compasec_intrablock_signature_updates();
   // map each MBB to its sum of all intra-block instruction updates
   std::map<const llvm::MachineBasicBlock *,
