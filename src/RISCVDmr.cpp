@@ -2254,18 +2254,14 @@ void RISCVDmr::protectStores() {
     // for (auto MI : stores_to_protect_) {
     for (auto MI : stores_) {
       auto opcode{MI->getOpcode()};
-      if (MI->hasOrderedMemoryRef() || //[joh] do not protect volatile or
-                                       // ordered
-                                       // memory instr
+      if (MI->hasOrderedMemoryRef() || // Ordered accesses cannot be read back.
           (MI->isInlineAsm() &&
            MI->getOperand(0).isSymbol())) { //[joh]: inline fence.i also
                                             // maystore #ifdef DBG
-        llvm::outs()
-            << "WARNING:" << *MI
-            << "RISCVDmr::protectStores(): skip inline assembly and volatiles"
-               "instructions -- needs fix\n";
-// #end
 #ifdef SWITCH_VOLATILE
+        llvm::outs() << "RISCVDmr::protectStores(): pre-store operand checks "
+                       "for ordered/inline-assembly access; no loadback: "
+                     << *MI;
         for (const auto &op : MI->operands()) {
           if (op.isReg()) {
             if (riscv_common::getRegType(op.getReg()) ==
@@ -2281,6 +2277,10 @@ void RISCVDmr::protectStores() {
             }
           }
         }
+#else
+        llvm::outs() << "WARNING: RISCVDmr::protectStores(): ordered/inline-"
+                       "assembly access has no store protection: "
+                     << *MI;
 #endif // ifdef SWITCH_VOLATILE
         continue;
       }
