@@ -950,7 +950,7 @@ llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
   return emitSoftBranchPredicate(before, *predicate, scratch);
 }
 
-llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
+llvm::MachineInstr *riscv_common::emitBranchPredicateDifference(
     llvm::MachineInstr &before, const SoftBranchPredicate &predicate,
     llvm::Register scratch) {
   require_insertion_point(before);
@@ -973,11 +973,22 @@ llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
   const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
   const auto insert = before.getIterator();
   const auto &DL = before.getDebugLoc();
-  llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::XOR))
+  return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::XOR))
       .addDef(scratch)
       .addReg(predicate.lhs)
-      .addReg(predicate.rhs);
+      .addReg(predicate.rhs)
+      .getInstr();
+}
 
+llvm::MachineInstr *
+riscv_common::emitSoftBranchPredicate(llvm::MachineInstr &before,
+                                      const SoftBranchPredicate &predicate,
+                                      llvm::Register scratch) {
+  emitBranchPredicateDifference(before, predicate, scratch);
+  auto &MBB = *before.getParent();
+  const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
+  const auto insert = before.getIterator();
+  const auto &DL = before.getDebugLoc();
   if (predicate.equality)
     return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::SLTIU))
         .addDef(scratch)
@@ -1091,6 +1102,23 @@ llvm::MachineInstr *riscv_common::tryEmitXPredPredicateSelectedAdd(
       .addImm(trueAdjustment)
       .addImm(falseAdjustment)
       .getInstr();
+}
+
+llvm::MachineInstr *riscv_common::emitXPredBranchSelectedAdd(
+    llvm::MachineInstr &before, llvm::Register signature,
+    llvm::Register difference, bool equality, int64_t falseAdjustment,
+    int64_t trueAdjustment) {
+  if (!llvm::isInt<6>(falseAdjustment) || !llvm::isInt<6>(trueAdjustment) ||
+      !falseAdjustment || !trueAdjustment || falseAdjustment == trueAdjustment)
+    llvm::report_fatal_error(
+        "COMPAS: predicate-xpred requires distinct nonzero signed-six-bit "
+        "edge adjustments; no fallback is permitted");
+  // NZ_SACC_I selects its first immediate on nonzero. A BEQ's taken arm
+  // belongs to zero; reversing the immediates avoids Boolean conversion.
+  return tryEmitXPredPredicateSelectedAdd(
+      before, signature, difference,
+      equality ? trueAdjustment : falseAdjustment,
+      equality ? falseAdjustment : trueAdjustment);
 }
 
 void riscv_common::saveRegs(std::vector<llvm::Register> regs,

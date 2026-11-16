@@ -164,6 +164,13 @@ llvm::MachineInstr *emitSoftBranchPredicate(
     llvm::MachineInstr &before, const SoftBranchPredicate &predicate,
     llvm::Register scratch);
 
+// Emit only lhs XOR rhs for hardware zero/nonzero selection. The same
+// register and function preconditions as emitSoftBranchPredicate apply.
+llvm::MachineInstr *
+emitBranchPredicateDifference(llvm::MachineInstr &before,
+                              const SoftBranchPredicate &predicate,
+                              llvm::Register scratch);
+
 // Compatibility overload: derive the predicate from the unchanged BEQ/BNE
 // insertion anchor rather than from explicitly supplied source operands.
 llvm::MachineInstr *emitSoftBranchPredicate(llvm::MachineInstr &before,
@@ -194,6 +201,14 @@ getXPredSelectiveAccumulateOpcode(const llvm::MachineFunction &MF);
 llvm::MachineInstr *tryEmitXPredPredicateSelectedAdd(
     llvm::MachineInstr &before, llvm::Register signature,
     llvm::Register predicate, int64_t falseAdjustment, int64_t trueAdjustment);
+
+// Consume a raw operand XOR and select according to the original BEQ/BNE.
+// Both adjustments must be distinct, nonzero signed-six-bit values. This
+// strict helper never falls back to a software sequence.
+llvm::MachineInstr *
+emitXPredBranchSelectedAdd(llvm::MachineInstr &before, llvm::Register signature,
+                           llvm::Register difference, bool equality,
+                           int64_t falseAdjustment, int64_t trueAdjustment);
 
 // save registers in the vector one by one onto the stack and do this
 // at the instruction point pointed to by iterator

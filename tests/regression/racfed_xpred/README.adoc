@@ -1,0 +1,57 @@
+= RASM and RACFED hardware-predicate regression
+
+Run from a standalone COMPAS checkout with an XPred-capable LLVM build:
+
+[source,sh]
+----
+python3 tests/regression/racfed_xpred/run.py \
+  --llvm-bin /path/to/xpred-llvm/bin \
+  --cc /path/to/riscv-none-elf-gcc \
+  --output build/tests/hardware-predicates
+----
+
+The runner uses only Python's standard library, the selected LLVM tools and an
+RV32-capable GNU linker driver. It does not import the surrounding compaspec
+study or require QEMU support for XPred. Commands, compiler diagnostics, linked
+disassembly, execution traces and `results.json` remain under `--output`.
+`--allow-missing-xpred` is intended for ordinary COMPAS CI: when `llvm-mc` does
+not advertise XPred, the runner checks that both monitors explicitly reject a
+hardware request and reports the hardware matrix as `skipped`. Without that
+option, missing XPred is a failure. An advertised but broken implementation
+always fails.
+
+The matrix covers both monitors with primary predicates, or NZDC shadow
+predicates, in standalone, NZDC, NZDC+NEMESIS and NZDC+NEMESEC configurations.
+RACFED additionally covers its CompaSeC policy and ordinary `orig`, `orig+dmr`
+and `all` coverage masks. Hardware mode requires `sacc.i` at every selected
+application branch. Both adjustments must be distinct, nonzero signed-six-bit
+values; allocation exhaustion and disabled extensions must fail explicitly.
+No software or wider conditional-accumulate fallback is accepted.
+
+Every compilation runs LLVM's machine verifier. Linked instructions must use
+one raw XOR on the selected operand stream followed by selective accumulation,
+with the application branch retaining its primary operands. NEMESIS/NEMESEC
+shadow direction branches remain for primary predicates and are replaced only
+for shadow predicates. RACFED's actual emitted ledger must account for exactly
+the eligible instructions, with the selected before/after placement. The
+ordinary three-instruction threshold and first-position zero exemption remain
+unchanged even where replacing four software helpers with one XOR reduces the
+number of eligible instructions. Separate fixtures exercise exactly zero, one,
+two and three original instructions before the predicate branch under both
+`orig` and `orig+dmr`, so the latter also exercises the single XOR in the threshold.
+
+`reference.py` independently interprets the linked RV32I and `sacc.i` instruction
+words with ordinary byte RAM. Both branch outcomes are compared with literal C
+expectations for return values and ordered stores, including wrapping inputs,
+architectural zero and a shared successor. DMR entry establishes the balanced
+calling convention from distinct nonzero register seeds. Return checks cover
+fixed registers, primary callee-saved state and balance of the borrowed signature
+register pair. The signature pair is caller-saved and need not retain its incoming value.
+NZDC+NEMESEC cases retain ordinary-store loadback and address/data checks before
+volatile stores. This test-local memory model does not claim peripheral effects.
+
+Additional checks cover mixed software/hardware functions, mixed RACFED
+policies, independent allocation seeds, exact signed-six-bit assembler limits,
+zero aliases, destination/source aliasing, full-width conditions and x0 behavior.
+This is fault-free compiler and ISA regression evidence. ETISS, Sail, RTL timing
+and instruction-skip campaigns remain separate validations.

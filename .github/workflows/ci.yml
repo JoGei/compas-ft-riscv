@@ -366,6 +366,15 @@ jobs:
           --cc "$RVGNU_INSTALL_DIR/bin/${{ matrix.rvgnu.base }}-gcc" \
           --qemu "qemu-riscv${{ matrix.arch.bits }}" \
           --build-dir "${GITHUB_WORKSPACE}/build/regression/racfed_predicate/${{ matrix.arch.name }}"
+    - name: Check hardware predicate feature validation and optional XPred matrix
+      if: matrix.arch.bits == '32'
+      working-directory: ${{ github.workspace }}/compas-ft-riscv_src
+      run: |
+        python3 tests/regression/racfed_xpred/run.py \
+          --llvm-bin "$LLVM_INSTALL_DIR/bin" \
+          --cc "$RVGNU_INSTALL_DIR/bin/${{ matrix.rvgnu.base }}-gcc" \
+          --output "${GITHUB_WORKSPACE}/build/regression/racfed_xpred/${{ matrix.arch.name }}" \
+          --allow-missing-xpred
     - name: Upload regression logs and summaries
       if: always()
       uses: actions/upload-artifact@v5

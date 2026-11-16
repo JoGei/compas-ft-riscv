@@ -79,11 +79,11 @@ protected:
   unsigned predicate_simm6_sites_{0};
   unsigned predicate_fused_sites_{0};
   unsigned predicate_range_fallbacks_{0};
-  // RACFED plans four software predicate helpers before collecting its
-  // ledger. The map holds the mask instruction patched with the difference.
-  // Signature selection is emitted after the ledger sum is known.
+  // RACFED plans predicate computations before collecting its selected ledger.
+  // Values are the software mask (patched with the edge difference), or the
+  // hardware raw XOR. Signature selection follows the actual ledger exit.
   std::map<const llvm::MachineInstr *, llvm::MachineInstr *>
-      prepared_predicate_masks_;
+      prepared_predicates_;
   std::set<const llvm::MachineInstr *> predicate_computations_;
   bool is_predicate_branch(const llvm::MachineInstr &MI) const;
   riscv_common::SoftBranchPredicate
@@ -109,7 +109,9 @@ protected:
   void generate_signatures();
   void generate_signatures_with_predicate_constraints();
   bool valid_predicate_exit(llvm::MachineBasicBlock &MBB, int signature) const;
-  bool try_generate_psp_simm6_signatures();
+  int select_hardware_predicate_exit(llvm::MachineBasicBlock &MBB,
+                                     int previous);
+  bool try_generate_psp_simm6_signatures(bool racfed = false);
   virtual void generate_intrablock_signature_updates();
   void generate_signature_checks();
   void generate_traversal_adjustments();
