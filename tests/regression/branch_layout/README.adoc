@@ -1,0 +1,40 @@
+= Taken branch to the layout successor
+
+This small machine-IR fixture reproduces a NEMESIS/NEMESEC CFG failure exposed
+by `pjpeg_decode_mcu` and `WikiSort` in Embench. Its non-entry condition block
+has this valid layout:
+
+[source,text]
+----
+condition:
+    bne a0, zero, nonzero
+    j zero
+nonzero:                       # physically next, but the taken successor
+    return a0 + 3
+zero:
+    return 7
+----
+
+LLVM's `getFallThrough()` can report the adjacent `nonzero` block because the
+explicit taken branch reaches it. Using that as the false successor caused
+both protection modes to replace the same edge twice and assert
+`Old is not a successor of this block`. `getLogicalFallThrough()` instead
+causes the existing conditional-splitting path to isolate the explicit false
+transfer. The condition is deliberately outside the entry block: incoming
+balance checks there can conceal this layout during branch analysis.
+
+The runner resumes the normal LLVM pipeline after `livedebugvalues` so earlier
+branch folding cannot remove the exact reproducer. The fixture is a leaf with
+no frame or calls, so no private call-frame indices need to survive machine-IR
+serialization. It compiles the ordinary reference and both protection modes,
+alone and with RASM or CompaSeC RACFED, with `-verify-machineinstrs` throughout.
+Both B2 and B3 fail on the original implementation.
+
+[source,shell]
+----
+python3 tests/regression/branch_layout/run.py \
+  --llc /path/to/compas-llvm/bin/llc
+----
+
+This is a compile-time regression. It retains commands, logs, assembly and
+`results.json`; it does not claim execution equivalence or fault coverage.

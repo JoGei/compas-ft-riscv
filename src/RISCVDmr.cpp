@@ -3127,7 +3127,11 @@ void RISCVDmr::protectBranches() {
 
         // fall-through path dup
 
-        llvm::MachineBasicBlock *nottaken_BB = MBB->getFallThrough();
+        // A taken branch can target the physically adjacent block while an
+        // explicit jump supplies the false edge. getFallThrough() also
+        // returns that taken layout successor; require actual fallthrough so
+        // the explicit false transfer is split below instead.
+        llvm::MachineBasicBlock *nottaken_BB = MBB->getLogicalFallThrough();
         if (nottaken_BB == nullptr) {
           // no fallthrough found. Most likely we have a
           // "b<cond> <>, taken \\ j nottaken" situation here, where the
@@ -3237,7 +3241,9 @@ void RISCVDmr::protectBranches() {
           llvm::outs() << "COMPAS_RACFED_NAIVE_SITE function=" << fname_
                        << " block=" << MBB->getNumber() << "\n";
 
-        auto nottaken_BB{MBB->getFallThrough()};
+        // Do not confuse a taken edge to the layout successor with the false
+        // edge of a conditional followed by an explicit jump.
+        auto nottaken_BB{MBB->getLogicalFallThrough()};
         if (nottaken_BB == nullptr) {
           // no fallthrough found. Most likely we have a
           // "b<cond> <>, taken \\ j nottaken" situation here, where the
