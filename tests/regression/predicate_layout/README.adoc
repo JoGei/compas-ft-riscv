@@ -1,0 +1,33 @@
+= Predicate branch-layout regression
+
+The fixtures have direct conditional transfers whose initial displacements fit
+RISC-V's signed 13-bit branch encoding. NZDC and RACFED instrumentation expands
+their final function bodies past that range. The regression covers forward and
+backward transfers for all six integer conditions under naive, software-predicate
+and hardware-predicate RACFED.
+
+[source,sh]
+----
+python3 tests/regression/predicate_layout/run.py \
+  --llc /path/to/llc \
+  --llvm-mc /path/to/llvm-mc \
+  --cc /path/to/riscv-none-elf-gcc \
+  --build-dir build/tests/predicate_layout
+----
+
+The compiler must pass `-verify-machineinstrs`, report at least one relaxed
+conditional, and produce an object accepted by LLVM's RISC-V assembler. The
+compiler and assembler must both include XPred support. No target simulation or
+fault injection runs as part of this test.
+
+COMPAS relaxes an out-of-range `cond T` to `!cond F; j T`, where `F` is the
+original fallthrough. Selection and signature accumulation still describe the
+original logical edge. The direct jump is transfer infrastructure, not a new
+application signature region. All remaining local direct jumps must fit the
+signed 21-bit JAL range; indirect long-jump expansion remains unsupported.
+
+The GNU assembler output must have exactly the same executable bytes as LLVM
+MC. A separate boundary fixture exercises a forward branch that would otherwise
+land at a 4092-byte displacement. COMPAS reserves one instruction of forward
+headroom and expands that edge itself, avoiding GNU's whole-function relaxation
+adding an extra transfer later. The backward architectural limit remains -4096.

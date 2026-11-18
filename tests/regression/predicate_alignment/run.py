@@ -262,8 +262,6 @@ def main():
                 ("missing-monitor", [x for x in options if not x.startswith("-" + monitor + "=")], "requires " + monitor, HERE / "unsupported.ll", []),
                 ("missing-dmr", flags(monitor, None, "shadow", "target_check"), "NZDC", HERE / "unsupported.ll", []),
                 ("fgs", [*flags(monitor, "NZDC", "shadow", "target_check"), "-FGS=target_check"], "CGS", HERE / "unsupported.ll", []),
-                ("relation", flags(monitor, "NZDC+NEMESIS", "shadow", "bad_relation"), "BEQ/BNE", HERE / "unsupported.ll", []),
-                ("call", flags(monitor, "NZDC", "primary", "bad_call"), "leaf", HERE / "unsupported.ll", []),
                 ("compressed", options, "RV32", HERE / "unsupported.ll", ["-mattr=+c,-relax"]),
                 ("rv64", options, "RV32", HERE / "unsupported.ll", ["-march=riscv64", "-mtriple=riscv64-unknown-elf", "-target-abi=lp64"]),
             ]

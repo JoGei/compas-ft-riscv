@@ -351,8 +351,6 @@ def main():
                 ("compressed", standard, "RV32", ["-mattr=+xpred,+c,-relax"]),
                 ("rv64", standard, "RV32", ["-march=riscv64", "-mtriple=riscv64-unknown-elf", "-target-abi=lp64"]),
                 ("fgs", [*standard, "-FGS=target_check"], "CGS", []),
-                ("relation", flags(monitor, "NZDC+NEMESIS", "shadow", "bad_relation"), "BEQ/BNE", []),
-                ("call", flags(monitor, "NZDC", "primary", "bad_call"), "leaf", []),
                 ("excluded-orig", flags(monitor, "NZDC+NEMESIS", "shadow", "target_check", mask="dmr+balance"), "orig", []),
             ]
             for case, options, diagnostic, target in invalid:

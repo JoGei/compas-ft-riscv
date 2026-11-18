@@ -15,6 +15,7 @@
  */
 
 #include "RISCVRasm.h"
+#include "RISCVPredicateLayout.h"
 #include "RISCVSubtarget.h"
 
 #include "common.h"
@@ -81,7 +82,7 @@ llvm::cl::opt<unsigned> racfed_predicate_psp_max_attempts{
 
 llvm::cl::opt<std::string> enable_rasm_predicate{
     "RASM-predicate",
-    llvm::cl::desc("RV32 equality-predicate signature selection; requires RASM for the same functions"),
+    llvm::cl::desc("RV32 branch-predicate signature selection; requires RASM for the same functions"),
     llvm::cl::value_desc("functions")};
 
 llvm::cl::opt<std::string> enable_rasm_predicate_unpadded{
@@ -177,7 +178,7 @@ void validate_predicate_cfg(llvm::MachineFunction &MF,
         continue;
       auto predicate = riscv_common::getSoftBranchPredicate(MI);
       if (!predicate)
-        llvm::report_fatal_error("COMPAS: RASM-predicate supports only direct BEQ/BNE register branches");
+        llvm::report_fatal_error("COMPAS: RASM-predicate supports only direct RV32 integer conditional branches");
       if (++conditional_count != 1)
         llvm::report_fatal_error("COMPAS: RASM-predicate requires one application conditional branch per block");
       for (auto next = std::next(MI.getIterator()); next != MBB.end(); ++next)
@@ -249,6 +250,9 @@ void validatePredicateComposition(const llvm::MachineFunction &MF,
   if (after_dmr)
     return;
 
+  if (MF.getFunction().hasPersonalityFn())
+    fail(" does not support exception-handling call edges");
+
   // Inspect application code before DMR adds checking branches or bridges.
   const auto *TII = ST.getInstrInfo();
   for (const auto &MBB : MF) {
@@ -260,9 +264,10 @@ void validatePredicateComposition(const llvm::MachineFunction &MF,
     for (const auto &MI : MBB) {
       if (MI.isInlineAsm())
         fail(" does not support inline assembly");
-      if ((MI.isCall() && !is_local_unconditional_jump(MI)) ||
-          TII->isTailCall(MI))
-        fail(" requires leaf functions, including no tail calls");
+      // Returning calls use the shared FP-relative signature save slot.
+      // Tail calls have no local continuation and need a separate contract.
+      if (TII->isTailCall(MI))
+        fail(" does not support tail calls");
       if (MI.isIndirectBranch() && !MI.isReturn())
         fail(" does not support indirect branches");
       for (const auto &MO : MI.operands())
@@ -274,7 +279,7 @@ void validatePredicateComposition(const llvm::MachineFunction &MF,
         continue;
       const auto predicate = riscv_common::getSoftBranchPredicate(MI);
       if (!predicate)
-        fail(" supports only direct BEQ/BNE register branches");
+        fail(" supports only direct RV32 integer conditional branches");
       if (++conditionals != 1)
         fail(" requires one application conditional branch per block");
       const auto next_block = std::next(MBB.getIterator());
@@ -394,12 +399,14 @@ void validateRasmPredicateOptions(const llvm::MachineFunction &MF,
 }
 
 bool RISCVRasm::runOnMachineFunction(llvm::MachineFunction &MF) {
+  naive_mode_ = false;
   validateRasmPredicateOptions(MF, true);
   MF_ = &MF;
   fname_ = std::string{MF_->getName()};
   TII_ = MF_->getSubtarget().getInstrInfo();
-  predicate_mode_ = riscv_common::inCSString(enable_rasm_predicate, fname_) ||
-                    riscv_common::inCSString(enable_rasm_predicate_shadow, fname_);
+  predicate_mode_ =
+      riscv_common::inCSString(enable_rasm_predicate, fname_) ||
+      riscv_common::inCSString(enable_rasm_predicate_shadow, fname_);
   predicate_unpadded_ =
       riscv_common::inCSString(enable_rasm_predicate_unpadded, fname_);
   predicate_shadow_mode_ =
@@ -439,7 +446,7 @@ riscv_common::SoftBranchPredicate
 RISCVRasm::predicate_operands(const llvm::MachineInstr &MI) const {
   auto predicate = riscv_common::getSoftBranchPredicate(MI);
   if (!predicate)
-    llvm::report_fatal_error("COMPAS: predicate lost its application BEQ/BNE");
+    llvm::report_fatal_error("COMPAS: predicate lost its application conditional branch");
   if (predicate_shadow_mode_) {
     const auto shadow_source = [&](llvm::Register source) {
       const auto pair = P2S_.find(source);
@@ -460,37 +467,11 @@ void RISCVRasm::validate_predicate_mode() {
 }
 
 void RISCVRasm::finalizePredicateLayout() {
-  if (!predicate_mode_)
+  if (!predicate_mode_ && !naive_mode_)
     return;
-  generate_predicate_entry_spacing();
-  validate_predicate_branch_span();
-}
-
-void RISCVRasm::validate_predicate_branch_span() {
-  // COMPAS executes after LLVM's branch-relaxation pass. Conservatively bound
-  // the whole final function, including its error block and worst-case block
-  // alignment padding, so every internal branch displacement fits signed 13
-  // bits without a later expansion changing the predicate/spacing template.
-  constexpr uint64_t MaxSpan = 4092;
-  uint64_t span = 0;
-  const auto add_bytes = [&](uint64_t bytes) {
-    if (bytes > MaxSpan - span)
-      llvm::report_fatal_error(
-          "COMPAS: RASM-predicate final conservative function span exceeds "
-          "4092 bytes; late branch relaxation is unsupported");
-    span += bytes;
-  };
-  for (const auto &MBB : *MF_) {
-    add_bytes(MBB.getAlignment().value() - 1);
-    for (const auto &MI : MBB) {
-      const unsigned size = TII_->getInstSizeInBytes(MI);
-      if ((!size && !MI.isMetaInstruction()) || size % 4)
-        llvm::report_fatal_error(
-            "COMPAS: RASM-predicate requires known fixed-width instruction "
-            "sizes for branch-span validation");
-      add_bytes(size);
-    }
-  }
+  if (predicate_mode_)
+    generate_predicate_entry_spacing();
+  riscv_common::relaxPredicateBranches(*MF_);
 }
 
 void RISCVRasm::generate_predicate_entry_spacing() {
@@ -1319,7 +1300,7 @@ void RISCVRasm::generate_traversal_adjustments() {
           const auto prepared = prepared_predicates_.find(MI);
           if (prepared != prepared_predicates_.end()) {
             // The selected ledger already includes the eligible predicate
-            // computations: four software helpers or one hardware-mode XOR.
+            // computations, including the comparison and any Boolean normalization.
             // Select the edge only after that ledger is complete.
             const int difference = target_adjustment - false_adjustment;
             if (!llvm::isInt<12>(false_adjustment) ||
@@ -1329,7 +1310,7 @@ void RISCVRasm::generate_traversal_adjustments() {
                   "fit signed 12-bit immediates");
             if (predicate_xpred_mode_) {
               riscv_common::emitXPredBranchSelectedAdd(
-                  *MI, kRTS, kC, MI->getOpcode() == llvm::RISCV::BEQ,
+                  *MI, kRTS, kC, predicate_operands(*MI).takenWhenZero(),
                   false_adjustment, target_adjustment);
               ++predicate_simm6_sites_;
               ++predicate_fused_sites_;
@@ -1359,8 +1340,8 @@ void RISCVRasm::generate_traversal_adjustments() {
                          << " sum=" << mbb_sum_ii_sigs_.at(&MBB);
             if (predicate_xpred_mode_)
               llvm::outs() << " lowering=sacc condition="
-                           << (MI->getOpcode() == llvm::RISCV::BEQ ? "eq"
-                                                                   : "ne");
+                           << (predicate_operands(*MI).takenWhenZero() ? "eq"
+                                                                       : "ne");
             llvm::outs() << "\n";
             carried_adjustment = false_adjustment;
             continue;
@@ -1378,7 +1359,7 @@ void RISCVRasm::generate_traversal_adjustments() {
           if (fused) {
             riscv_common::emitBranchPredicateDifference(*MI, predicate, kC);
             riscv_common::emitXPredBranchSelectedAdd(
-                *MI, kRTS, kC, predicate.equality, false_adjustment,
+                *MI, kRTS, kC, predicate.takenWhenZero(), false_adjustment,
                 target_adjustment);
             ++predicate_fused_sites_;
           } else {
@@ -1504,6 +1485,7 @@ void RISCVRasm::generate_traversal_adjustments() {
 // ------------------------------------------- RACFED --------------------------
 
 bool RISCVRacfed::runOnMachineFunction(llvm::MachineFunction &MF) {
+  naive_mode_ = riscv_common::usesRacfedNaiveBranches(MF);
   validateRacfedCompaSeCOptions(MF);
   validateRacfedPredicateOptions(MF, true);
   MF_ = &MF;
@@ -1571,16 +1553,15 @@ void RISCVRacfed::prepare_predicates() {
       prepared_predicates_.emplace(branch, difference);
       continue;
     }
-    auto *boolean =
-        riscv_common::emitSoftBranchPredicate(*branch, predicate, kC);
-    auto *difference = &*std::prev(boolean->getIterator());
-    auto *mask =
-        llvm::BuildMI(MBB, branch->getIterator(), branch->getDebugLoc(),
-                      TII_->get(llvm::RISCV::SUB))
-            .addDef(kC)
-            .addReg(riscv_common::k0)
-            .addReg(kC)
-            .getInstr();
+    const auto before = branch->getIterator();
+    auto *previous = before == MBB.begin() ? nullptr : &*std::prev(before);
+    riscv_common::emitSoftBranchPredicate(*branch, predicate, kC);
+    llvm::BuildMI(MBB, branch->getIterator(), branch->getDebugLoc(),
+                  TII_->get(llvm::RISCV::SUB))
+        .addDef(kC)
+        .addReg(riscv_common::k0)
+        .addReg(kC)
+        .getInstr();
     auto *selection =
         llvm::BuildMI(MBB, branch->getIterator(), branch->getDebugLoc(),
                       TII_->get(llvm::RISCV::ANDI))
@@ -1588,7 +1569,11 @@ void RISCVRacfed::prepare_predicates() {
             .addReg(kC)
             .addImm(0) // Patched after the complete intra-block ledger.
             .getInstr();
-    for (auto *MI : {difference, boolean, mask, selection}) {
+    // Relational comparisons can require fewer helpers than equality.
+    // Admit exactly the instructions inserted above, independently of count.
+    auto first = previous ? std::next(previous->getIterator()) : MBB.begin();
+    for (auto I = first; I != branch->getIterator(); ++I) {
+      auto *MI = &*I;
       // Explicit provenance admits only these generated computations. The
       // final edge ADDI/ADD and monitor infrastructure remain unclassified.
       riscv_common::setRsmInstructionCategory(*MI,

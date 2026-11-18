@@ -143,13 +143,28 @@ void loadCallRegsAs(const std::vector<llvm::Register> &snapshot_regs,
                     llvm::MachineBasicBlock *,
                     llvm::MachineBasicBlock::iterator, CallFrameBank);
 
-// A direct equality/inequality branch over physical integer registers. This
-// description carries no signature-monitor or data-duplication policy.
+enum class SoftBranchCondition {
+  Equal,
+  NotEqual,
+  SignedLessThan,
+  SignedGreaterEqual,
+  UnsignedLessThan,
+  UnsignedGreaterEqual
+};
+
+// A direct RV32/RV64 integer branch over physical registers. This description
+// carries no signature-monitor or data-duplication policy; shadow selection
+// replaces lhs/rhs without changing the condition or successor orientation.
 struct SoftBranchPredicate {
   llvm::Register lhs;
   llvm::Register rhs;
   llvm::MachineBasicBlock *taken;
-  bool equality;
+  SoftBranchCondition condition;
+
+  bool isEqualityComparison() const;
+  // The raw producer is XOR for EQ/NE and SLT/SLTU for relational branches.
+  // EQ/GE/GEU select the taken edge on zero; NE/LT/LTU select it on nonzero.
+  bool takenWhenZero() const;
 };
 
 std::optional<SoftBranchPredicate>
@@ -164,15 +179,17 @@ llvm::MachineInstr *emitSoftBranchPredicate(
     llvm::MachineInstr &before, const SoftBranchPredicate &predicate,
     llvm::Register scratch);
 
-// Emit only lhs XOR rhs for hardware zero/nonzero selection. The same
-// register and function preconditions as emitSoftBranchPredicate apply.
+// Emit one raw difference/comparison: lhs XOR rhs for EQ/NE, signed SLT for
+// LT/GE, or unsigned SLTU for LTU/GEU. Hardware selection uses takenWhenZero()
+// to orient the two adjustments. The same register and function preconditions
+// as emitSoftBranchPredicate apply. Return the inserted producer instruction.
 llvm::MachineInstr *
 emitBranchPredicateDifference(llvm::MachineInstr &before,
                               const SoftBranchPredicate &predicate,
                               llvm::Register scratch);
 
-// Compatibility overload: derive the predicate from the unchanged BEQ/BNE
-// insertion anchor rather than from explicitly supplied source operands.
+// Compatibility overload: derive the predicate from the unchanged direct
+// integer branch anchor rather than explicitly supplied source operands.
 llvm::MachineInstr *emitSoftBranchPredicate(llvm::MachineInstr &before,
                                            llvm::Register scratch);
 
@@ -202,12 +219,13 @@ llvm::MachineInstr *tryEmitXPredPredicateSelectedAdd(
     llvm::MachineInstr &before, llvm::Register signature,
     llvm::Register predicate, int64_t falseAdjustment, int64_t trueAdjustment);
 
-// Consume a raw operand XOR and select according to the original BEQ/BNE.
+// Consume a raw difference/comparison and select according to taken_when_zero
+// from the original branch descriptor. No Boolean normalization is necessary.
 // Both adjustments must be distinct, nonzero signed-six-bit values. This
 // strict helper never falls back to a software sequence.
 llvm::MachineInstr *
 emitXPredBranchSelectedAdd(llvm::MachineInstr &before, llvm::Register signature,
-                           llvm::Register difference, bool equality,
+                           llvm::Register difference, bool taken_when_zero,
                            int64_t falseAdjustment, int64_t trueAdjustment);
 
 // save registers in the vector one by one onto the stack and do this

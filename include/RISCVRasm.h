@@ -40,7 +40,7 @@ public:
   bool runOnMachineFunction(llvm::MachineFunction &) override;
 
   // Run after the shared pipeline normalizes check continuations, so padding
-  // and the conservative branch-span check describe the final layout.
+  // and branch relaxation describe the final emitted layout.
   void finalizePredicateLayout();
 
   static unsigned get_runtime_signature_reg(void) { return kRTS; }
@@ -69,6 +69,7 @@ protected:
   std::unique_ptr<riscv_common::RsmRegions> regions_;
   // Opt-in first consumer of the shared soft-predicate lowering helpers.
   bool predicate_mode_{false};
+  bool naive_mode_{false};
   // Independent per-function modifiers; the historical mode remains padded
   // and derives the predicate from the primary application-branch operands.
   bool predicate_unpadded_{false};
@@ -81,7 +82,7 @@ protected:
   unsigned predicate_range_fallbacks_{0};
   // RACFED plans predicate computations before collecting its selected ledger.
   // Values are the software mask (patched with the edge difference), or the
-  // hardware raw XOR. Signature selection follows the actual ledger exit.
+  // hardware raw comparison. Signature selection follows the actual ledger exit.
   std::map<const llvm::MachineInstr *, llvm::MachineInstr *>
       prepared_predicates_;
   std::set<const llvm::MachineInstr *> predicate_computations_;
@@ -89,7 +90,6 @@ protected:
   riscv_common::SoftBranchPredicate
   predicate_operands(const llvm::MachineInstr &MI) const;
   void validate_predicate_mode();
-  void validate_predicate_branch_span();
   void generate_predicate_entry_spacing();
 
   // for initialization purposes

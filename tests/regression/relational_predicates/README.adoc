@@ -1,0 +1,30 @@
+= Relational branch predicate regression
+
+Run `python3 run.py --llvm-bin <patched-LLVM-bin> --cc <RV32-capable-GCC> --output <new-directory>`.
+The runner retains exact commands, machine-verifier logs, linked disassembly,
+source hashes and a JSON result. It requires the native SACC-enabled compiler.
+
+The fixture covers equality, inequality, signed less-than/greater-or-equal and
+unsigned less-than/greater-or-equal, plus signed comparisons against zero.
+Both direct successor paths have distinct return values and observable ordered
+stores. An ordinary function remains outside every protection selection.
+
+Matched F/N/G/H configurations use NZDC+NEMESEC and the CompaSeC RACFED policy.
+Further configurations exercise standalone primary RASM/RACFED predicates and
+RASM shadow predicates, with software and strict native SACC lowering.
+The linked code must use XOR for equality, SLT for signed relations and SLTU
+for unsigned relations, selecting the original primary or mapped shadow
+operands, including the faultable shadow of architectural zero.
+Software predicates normalize only when required; the exact resulting helper
+sequence must appear in the RACFED ledger with nonzero following updates.
+Hardware predicates use one raw comparison and one native SACC with distinct,
+nonzero signed-six-bit adjustments.
+
+The shared interpreter from `../racfed_xpred/reference.py` checks the linked
+RV32 words against an independent source-comparison oracle. The Cartesian
+input set includes zero, one, the largest positive signed word, the smallest
+negative signed word, minus two and minus one. Every function covers both
+source outcomes. Checks include return values, ordered observable stores,
+stack restoration and primary/shadow balance at protected returns.
+These are fault-free linked-instruction regressions, not RTL simulation,
+performance measurements, fault-injection coverage or a proof over all inputs.

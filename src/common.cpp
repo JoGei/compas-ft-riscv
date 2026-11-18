@@ -922,9 +922,30 @@ void riscv_common::loadCallRegsAs(
 
 std::optional<riscv_common::SoftBranchPredicate>
 riscv_common::getSoftBranchPredicate(const llvm::MachineInstr &branch) {
-  if ((branch.getOpcode() != llvm::RISCV::BEQ &&
-       branch.getOpcode() != llvm::RISCV::BNE) ||
-      branch.getNumOperands() < 3 || branch.getNumExplicitOperands() != 3)
+  SoftBranchCondition condition;
+  switch (branch.getOpcode()) {
+  case llvm::RISCV::BEQ:
+    condition = SoftBranchCondition::Equal;
+    break;
+  case llvm::RISCV::BNE:
+    condition = SoftBranchCondition::NotEqual;
+    break;
+  case llvm::RISCV::BLT:
+    condition = SoftBranchCondition::SignedLessThan;
+    break;
+  case llvm::RISCV::BGE:
+    condition = SoftBranchCondition::SignedGreaterEqual;
+    break;
+  case llvm::RISCV::BLTU:
+    condition = SoftBranchCondition::UnsignedLessThan;
+    break;
+  case llvm::RISCV::BGEU:
+    condition = SoftBranchCondition::UnsignedGreaterEqual;
+    break;
+  default:
+    return std::nullopt;
+  }
+  if (branch.getNumOperands() < 3 || branch.getNumExplicitOperands() != 3)
     return std::nullopt;
 
   const auto &lhs = branch.getOperand(0);
@@ -937,7 +958,18 @@ riscv_common::getSoftBranchPredicate(const llvm::MachineInstr &branch) {
     return std::nullopt;
 
   return SoftBranchPredicate{lhs.getReg(), rhs.getReg(), target.getMBB(),
-                             branch.getOpcode() == llvm::RISCV::BEQ};
+                             condition};
+}
+
+bool riscv_common::SoftBranchPredicate::isEqualityComparison() const {
+  return condition == SoftBranchCondition::Equal ||
+         condition == SoftBranchCondition::NotEqual;
+}
+
+bool riscv_common::SoftBranchPredicate::takenWhenZero() const {
+  return condition == SoftBranchCondition::Equal ||
+         condition == SoftBranchCondition::SignedGreaterEqual ||
+         condition == SoftBranchCondition::UnsignedGreaterEqual;
 }
 
 llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
@@ -945,8 +977,8 @@ llvm::MachineInstr *riscv_common::emitSoftBranchPredicate(
   const auto predicate = getSoftBranchPredicate(before);
   if (!predicate)
     llvm::report_fatal_error(
-        "COMPAS: soft predicate supports only direct BEQ/BNE with physical "
-        "integer operands");
+        "COMPAS: soft predicate requires a direct BEQ/BNE/BLT/BGE/BLTU/BGEU "
+        "with physical integer operands");
   return emitSoftBranchPredicate(before, *predicate, scratch);
 }
 
@@ -973,7 +1005,24 @@ llvm::MachineInstr *riscv_common::emitBranchPredicateDifference(
   const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
   const auto insert = before.getIterator();
   const auto &DL = before.getDebugLoc();
-  return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::XOR))
+  unsigned opcode;
+  switch (predicate.condition) {
+  case SoftBranchCondition::Equal:
+  case SoftBranchCondition::NotEqual:
+    opcode = llvm::RISCV::XOR;
+    break;
+  case SoftBranchCondition::SignedLessThan:
+  case SoftBranchCondition::SignedGreaterEqual:
+    opcode = llvm::RISCV::SLT;
+    break;
+  case SoftBranchCondition::UnsignedLessThan:
+  case SoftBranchCondition::UnsignedGreaterEqual:
+    opcode = llvm::RISCV::SLTU;
+    break;
+  default:
+    llvm::report_fatal_error("COMPAS: invalid soft branch condition");
+  }
+  return llvm::BuildMI(MBB, insert, DL, TII->get(opcode))
       .addDef(scratch)
       .addReg(predicate.lhs)
       .addReg(predicate.rhs)
@@ -984,12 +1033,20 @@ llvm::MachineInstr *
 riscv_common::emitSoftBranchPredicate(llvm::MachineInstr &before,
                                       const SoftBranchPredicate &predicate,
                                       llvm::Register scratch) {
-  emitBranchPredicateDifference(before, predicate, scratch);
+  auto *raw = emitBranchPredicateDifference(before, predicate, scratch);
+  if (!predicate.isEqualityComparison() && !predicate.takenWhenZero())
+    return raw; // SLT/SLTU already materializes the taken Boolean.
   auto &MBB = *before.getParent();
   const auto *TII = MBB.getParent()->getSubtarget().getInstrInfo();
   const auto insert = before.getIterator();
   const auto &DL = before.getDebugLoc();
-  if (predicate.equality)
+  if (!predicate.isEqualityComparison())
+    return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::XORI))
+        .addDef(scratch)
+        .addReg(scratch)
+        .addImm(1)
+        .getInstr();
+  if (predicate.takenWhenZero())
     return llvm::BuildMI(MBB, insert, DL, TII->get(llvm::RISCV::SLTIU))
         .addDef(scratch)
         .addReg(scratch)
@@ -1106,19 +1163,19 @@ llvm::MachineInstr *riscv_common::tryEmitXPredPredicateSelectedAdd(
 
 llvm::MachineInstr *riscv_common::emitXPredBranchSelectedAdd(
     llvm::MachineInstr &before, llvm::Register signature,
-    llvm::Register difference, bool equality, int64_t falseAdjustment,
+    llvm::Register difference, bool taken_when_zero, int64_t falseAdjustment,
     int64_t trueAdjustment) {
   if (!llvm::isInt<6>(falseAdjustment) || !llvm::isInt<6>(trueAdjustment) ||
       !falseAdjustment || !trueAdjustment || falseAdjustment == trueAdjustment)
     llvm::report_fatal_error(
         "COMPAS: predicate-xpred requires distinct nonzero signed-six-bit "
         "edge adjustments; no fallback is permitted");
-  // NZ_SACC_I selects its first immediate on nonzero. A BEQ's taken arm
-  // belongs to zero; reversing the immediates avoids Boolean conversion.
+  // NZ_SACC_I selects its first immediate on nonzero. EQ/GE/GEU take the
+  // zero arm of their raw producer; swapping avoids Boolean conversion.
   return tryEmitXPredPredicateSelectedAdd(
       before, signature, difference,
-      equality ? trueAdjustment : falseAdjustment,
-      equality ? falseAdjustment : trueAdjustment);
+      taken_when_zero ? trueAdjustment : falseAdjustment,
+      taken_when_zero ? falseAdjustment : trueAdjustment);
 }
 
 void riscv_common::saveRegs(std::vector<llvm::Register> regs,

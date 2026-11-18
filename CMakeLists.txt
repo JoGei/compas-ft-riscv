@@ -8,6 +8,7 @@ add_llvm_library(Sihft
     src/RISCVCompasHardening.cpp
     src/RISCVCfcss.cpp
     src/RISCVPrepareCallFrame.cpp
+    src/RISCVPredicateLayout.cpp
     src/RISCVRasm.cpp
     src/RISCVRsm.cpp
     src/RISCVDmr.cpp

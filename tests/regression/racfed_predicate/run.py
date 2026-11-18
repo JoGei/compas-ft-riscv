@@ -416,15 +416,13 @@ def main():
             require(failed.returncode != 0 and diagnostic in failed.stderr
                     and "COMPAS: Running" not in failed.stdout,
                     "naive-" + name + ": rejected before DMR mutation")
-        for name, diagnostic in (("bad_relation", "BEQ/BNE"), ("bad_call", "leaf")):
-            failed = run([*backend, *flags(name), HERE / "unsupported.ll", "-o", out / (name + ".s")], name, expect=None)
-            require(failed.returncode != 0 and diagnostic in failed.stderr,
-                    name + ": explicit unsupported-form diagnostic")
-            failed = run([*backend, *flags(name, predicate=False, naive=True), HERE / "unsupported.ll",
-                          "-o", out / ("naive-" + name + ".s")], "naive-" + name, expect=None)
-            require(failed.returncode != 0 and "RACFED-naive-branches" in failed.stderr
-                    and diagnostic in failed.stderr and "COMPAS: Running" not in failed.stdout,
-                    "naive-" + name + ": unsupported form rejected before mutation")
+        # Historical rejection fixtures now exercise supported workload forms.
+        for name in ("bad_relation", "bad_call"):
+            for naive in (False, True):
+                label = ("naive-" if naive else "predicate-") + name
+                result = run([*backend, *flags(name, predicate=not naive, naive=naive),
+                              HERE / "unsupported.ll", "-o", out / (label + ".s")], label)
+                require(result.returncode == 0, label + ": relational branch or returning call verified")
         for name, target_options in (
             ("compressed", ["-mattr=+c,-relax"]),
             ("rv64", ["-march=riscv64", "-mtriple=riscv64-unknown-elf", "-target-abi=lp64"]),

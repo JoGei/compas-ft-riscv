@@ -1,0 +1,60 @@
+= Returning calls with CompaSeC predicates
+
+Run the compiler and linked-code checks with the XPred-capable LLVM build:
+
+[source,sh]
+----
+python3 tests/regression/predicate_calls/run.py \
+  --llvm-bin /path/to/xpred-llvm/bin \
+  --cc /path/to/riscv-none-elf-gcc \
+  --output build/tests/predicate-calls
+----
+
+The default run compiles, runs the machine verifier, inspects machine IR, and
+links F, N, G and H. It runs no target code, platform simulator or fault
+injection. Add `--execute-reference` for the optional, test-local architectural
+oracle: the existing independent RV32I/SACC interpreter plus a local low-word
+MUL implementation. It checks literal results and complete ordered writes to
+the fixture's three observable globals. This provides no timing or fault
+coverage claim. `results.json` records whether execution was requested.
+
+All profiles use identical function selections, RV32IM/ILP32, CGS, no inlining,
+and no sibling-call or link relaxation. N retains B3 guards while removing
+shadow direction decisions. G uses shadow software predicates; H requires
+SACC at every application predicate, with distinct nonzero signed-six-bit
+adjustments. The runner checks the compiler's site records against linked
+hardware instruction counts.
+
+The fixture covers direct protected calls, a direct ordinary-ABI helper which
+deliberately overwrites both `t0` and `t4`, a volatile indirect callback with two
+protected targets, ten-argument calls with two outgoing stack slots, a local
+frame larger than 4KB, and recursion. Values remain live across each call.
+Both outcomes of the surrounding predicates have literal expected results and
+ordered stores. Optional architectural checks also require preservation of
+the caller's RA, SP, GP, TP and FP.
+
+Machine-IR checks require each ordinary returning call to save RTS in a fixed
+caller-frame slot, restore the same slot after return, then perform the call's
+post-instruction ledger update. This ordering matters: a callee may overwrite
+RTS, and restoring after its ledger update would erase that update. The save
+does not move SP or use the outgoing stack-argument area. Original ABI call
+operands must not explicitly use `x5` or `x29`; register-mask clobbers are not
+application uses. Indirect calls must retain their shadow result and custom
+register-mask metadata.
+
+A second compiler path inserts a pre-existing 4KB fixed object before frame
+layout. This forces the signature slot beyond the load/store immediate range,
+so both save and restore must form its address in `t4`. It checks that predicate
+scratch state is computed after calls, rather than depending on a scratch
+value surviving a call. The optional oracle checks both outcomes again.
+
+Indirect targets must implement the caller's protected calling convention.
+There is no runtime adapter for an arbitrary mixture of ordinary and protected
+targets. The Embench callback population selects its targets consistently.
+Returning calls use the existing NZDC shadow argument/result and fixed-frame
+machinery; predicate lowering does not introduce a second call ABI.
+
+Tail transfers and functions with exception personalities remain explicit
+negative probes for N/G/H. Normal-return signature restoration does not restore
+state along an unwind edge, so accepting an exception CFG would require a
+separate preservation and signature-transition contract.
